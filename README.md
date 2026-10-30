@@ -61,14 +61,26 @@ The signed data is projected to exactly three fields, so the contract knows what
 
 ### Pricing
 
-The underwriter agent buys the last N days of the same flight from AeroDataBox (0.05 aUSD per call over x402),
-counts how many of the `n` observed flights arrived at least `threshold` minutes late (`k`), and prices with a
-Beta(1,1) prior so a short history never gives a zero price:
+The underwriter agent prices each flight from its own track record, which it buys from AeroDataBox over x402:
+
+1. `flightDates` gives the dates the flight number operated on, so a flight that runs only on some weekdays is priced
+   from its own last N departures, not from empty calendar days.
+2. `flightStatusOnDate` for each of those dates gives how late it arrived (`n` flights with an actual arrival, `k` of
+   them at least `threshold` minutes late).
+3. The probability uses a Beta(1,1) prior, so a short history never gives zero:
 
 ```
 P(delay) = (k + 1) / (n + 2)
 premium  = payout × P(delay) × 1.2        (20 % margin, minimum 0.05 aUSD)
 ```
+
+The agent refuses to sell when:
+
+- fewer than 2 of the past flights have an actual arrival time in AeroDataBox: the contract settles from that time,
+  so the policy might never be settleable;
+- the premium would reach the payout (P(delay) above 1/1.2): no one should pay that.
+
+A quote is valid for 10 minutes, so there is no time to wait for delay news before buying.
 
 ### No cover after departure
 
@@ -169,7 +181,7 @@ the deployment above.
 ### Agent
 
 ```sh
-node --env-file=.env src/agent.ts quote <flight> <YYYY-MM-DD> [payout aUSD] [threshold minutes] [history days]
+node --env-file=.env src/agent.ts quote <flight> <YYYY-MM-DD> [payout aUSD] [threshold minutes] [history flights]
 node --env-file=.env src/agent.ts buy
 node --env-file=.env src/agent.ts keeper
 node --env-file=.env src/agent.ts status
@@ -177,8 +189,8 @@ node --env-file=.env src/agent.ts status
 
 | Command | What it does |
 | --- | --- |
-| `quote` | Checks the flight's schedule for that date and refuses if it has departed, is already late or leaves within 2 hours. Then buys `history days` (default 5) of the flight's history over x402, estimates the delay probability, prices the policy and signs a quote as underwriter, valid for 1 hour and never past 2 hours before departure. Saves it to `quote.json`. Defaults: payout 2 aUSD, threshold 120 minutes. |
-| `buy` | Approves aUSD if needed and buys the policy in `quote.json`. |
+| `quote` | Checks the flight's schedule for that date and refuses if it has departed, is already late or leaves within 2 hours. Looks up the dates the flight operated on, buys its last `history` flights (default 5, 2 to 14) over x402, prices the policy and signs a quote as underwriter, valid for 10 minutes and never past 2 hours before departure. Refuses if the flight's arrivals are not reported or the premium would reach the payout. Saves the quote to `quote.json`. Defaults: payout 2 aUSD, threshold 120 minutes. |
+| `buy` | Approves exactly the premium in aUSD and buys the policy in `quote.json`. |
 | `keeper` | For every active policy, fetches the signed flight status over x402, verifies it off-chain, and calls `settle`. Skips flights that have not landed yet. `keeper --file <response.json>` submits a saved response instead. |
 | `status` | Shows the pool, the reserved amount and every policy with its status. |
 | `withdraw` | Underwriter only: takes back everything in the pool that is not reserved for active policies. |
@@ -223,5 +235,7 @@ node --env-file=.env src/agent.ts status
 - In the demo the underwriter and the traveller are the same wallet. They are separate roles in the contract.
 - The pricing model uses only the same flight's recent history. Route, airport and weather data from other AirnodeHub
   listings would sharpen it.
+- A flight that AeroDataBox reported well in the past can still miss an arrival time; the underwriter carries that
+  risk, and the policy expires with its reserve returned to the pool.
 
 Built on the [AirnodeHub hackathon starter](https://github.com/api3dao/airnodehub-hackathon-starter) (MIT).

@@ -52,15 +52,24 @@ const shiftDate = (dateLocal: string, days: number) => {
   return d.toISOString().slice(0, 10);
 };
 
-/** Arrival delay in minutes of the operating flight in a full AeroDataBox response, or undefined if unknown */
-export const arrivalDelayMinutes = (flights: unknown): number | undefined => {
+/**
+ * Arrival delay of the operating flight in a full AeroDataBox response, read the same way the contract reads it
+ * (status Arrived, arrival revisedTime against scheduledTime), or why there is none.
+ */
+export const arrivalDelay = (data: string): { minutes?: number; reason: string } => {
+  const flights = data ? JSON.parse(data) : undefined;
   const flight = Array.isArray(flights) ? flights[0] : undefined;
-  if (flight?.status !== 'Arrived') return undefined;
+  if (!flight) return { reason: 'did not operate' };
+  if (flight.status !== 'Arrived') return { reason: `status ${flight.status}` };
   const scheduled = flight.arrival?.scheduledTime?.utc;
   const actual = flight.arrival?.revisedTime?.utc;
-  if (!scheduled || !actual) return undefined;
-  return Math.max(0, Math.round((parseUtc(actual) - parseUtc(scheduled)) / 60_000));
+  if (!scheduled || !actual) return { reason: 'no actual arrival time' };
+  const minutes = Math.max(0, Math.round((parseUtc(actual) - parseUtc(scheduled)) / 60_000));
+  return { minutes, reason: `${minutes} min late` };
 };
+
+/** Every YYYY-MM-DD in a response, whatever its shape, newest first */
+export const datesIn = (data: string) => [...new Set(data.match(/\d{4}-\d{2}-\d{2}/g) ?? [])].sort().reverse();
 
 /**
  * Premium = payout x P(delay >= threshold) x (1 + margin), with P estimated from the observed history using a
@@ -84,6 +93,9 @@ async function quote(flightText: string, dateLocal: string, payoutText = '2', th
   const payout = parseUnits(payoutText, 6);
   const threshold = Number(thresholdText);
   const days = Number(daysText);
+  if (payout <= 0n) throw new Error(`Payout ${payoutText} must be more than 0`);
+  if (!Number.isInteger(threshold) || threshold < 1) throw new Error(`Threshold ${thresholdText} must be whole minutes, at least 1`);
+  if (!Number.isInteger(days) || days < 2 || days > 14) throw new Error(`History ${daysText} must be 2 to 14 flights`);
   const payingFetch = createScriptFetch();
 
   // 1. Is the flight still sellable? Buy its schedule for that date and stop if it has departed, is already known to
@@ -116,29 +128,65 @@ async function quote(flightText: string, dateLocal: string, payoutText = '2', th
   }
 
   log(`Pricing ${flightNumber} on ${dateLocal}: payout ${aUSD(payout)} if ${threshold}+ min late`);
-  // 2. Price it from the flight's recent history.
-  log(`Buying ${days} days of history from AeroDataBox over x402 (0.05 aUSD per call)`);
+
+  // 2. Which past dates did this flight operate on? A flight that runs a few days a week has no flight on most
+  //    calendar days, so ask flightDates and price from the flight's own last `days` departures.
+  const today = new Date().toISOString().slice(0, 10);
+  let history: string[] = [];
+  log(`Looking up the dates ${flightNumber} operated on (0.05 aUSD)`);
+  try {
+    const operated = await fetchSignedResponse(
+      AERODATABOX_URL,
+      { operation: 'flightDates', parameters: { searchBy: 'number', searchParam: flightNumber } },
+      payingFetch
+    );
+    history = datesIn(operated.data ?? '').filter((d) => d < today).slice(0, days);
+  } catch (error) {
+    log(`  flightDates failed (${(error as Error).message.slice(0, 80)})`);
+  }
+  if (history.length === 0) {
+    history = Array.from({ length: days }, (_, i) => shiftDate(today, -(i + 1)));
+    log(`  no past dates found, using the last ${days} calendar days`);
+  } else {
+    log(`  last ${history.length} departures: ${history.join(', ')}`);
+  }
+
+  // 3. Buy the outcome of each of those flights over x402 and price from them.
+  log(`Buying ${history.length} past flights from AeroDataBox over x402 (0.05 aUSD each)`);
   const delays: number[] = [];
-  for (let i = 1; i <= days; i++) {
-    const day = shiftDate(dateLocal, -i);
+  for (const day of history) {
     const request: AirnodeV2Request = {
       operation: 'flightStatusOnDate',
       parameters: { searchBy: 'number', searchParam: flightNumber, dateLocal: day, dateLocalRole: 'Departure' },
     };
     try {
       const signed = await fetchSignedResponse(AERODATABOX_URL, request, payingFetch);
-      const delay = signed.data ? arrivalDelayMinutes(JSON.parse(signed.data)) : undefined;
-      log(`  ${day}: ${delay === undefined ? 'no arrival data' : `${delay} min late`}`);
-      if (delay !== undefined) delays.push(delay);
+      const { minutes, reason } = arrivalDelay(signed.data);
+      log(`  ${day}: ${reason}`);
+      if (minutes !== undefined) delays.push(minutes);
     } catch (error) {
       log(`  ${day}: skipped (${(error as Error).message.slice(0, 80)})`);
     }
   }
 
+  // 4. Sell only what can be settled and is worth buying.
+  //    The contract settles from the arrival revisedTime. If AeroDataBox did not report one for this flight's recent
+  //    arrivals, it may not report one for this flight either, and the policy could never pay out.
+  const MIN_OBSERVED_ARRIVALS = 2;
+  if (delays.length < MIN_OBSERVED_ARRIVALS) {
+    throw new Error(
+      `Not selling: only ${delays.length} of ${history.length} past flights have an actual arrival time in AeroDataBox, ` +
+        `so this policy might never be settleable`
+    );
+  }
   const { n, k, probability, premium } = priceFromHistory(delays, threshold, payout);
-  log(`${k} of ${n} observed flights were ${threshold}+ min late -> P(delay) = ${probability.toFixed(3)}`);
-  log(`Premium: ${aUSD(premium)}`);
+  log(`${k} of ${n} observed flights were ${threshold}+ min late -> P(delay) = (${k}+1)/(${n}+2) = ${probability.toFixed(3)}`);
+  log(`Premium: ${aUSD(payout)} x ${probability.toFixed(3)} x 1.2 = ${aUSD(premium)}`);
+  //    At P(delay) above 1/1.2 the premium would reach the payout: nobody should pay that, so do not sell it.
+  if (premium >= payout) throw new Error(`Not selling: the premium ${aUSD(premium)} would not be below the payout`);
 
+  //    A short validity leaves no time to wait for delay news before buying.
+  const QUOTE_VALIDITY = 10 * 60;
   const q = {
     holder: account.address,
     flightNumber,
@@ -146,7 +194,7 @@ async function quote(flightText: string, dateLocal: string, payoutText = '2', th
     premium,
     payout,
     delayThresholdMinutes: BigInt(threshold),
-    validUntil: BigInt(Math.min(now + 3600, salesClose - 1)),
+    validUntil: BigInt(Math.min(now + QUOTE_VALIDITY, salesClose - 1)),
     nonce: BigInt(Date.now()),
   };
   const quoteHash = (await publicClient.readContract({
@@ -185,14 +233,15 @@ async function buy() {
     args: [account.address, FLIGHTGUARD],
   });
   if (allowance < q.premium) {
+    // Approve exactly the premium, not an unlimited amount
     const hash = await walletClient.writeContract({
       address: AUSD,
       abi: erc20Abi,
       functionName: 'approve',
-      args: [FLIGHTGUARD, 2n ** 256n - 1n],
+      args: [FLIGHTGUARD, q.premium],
     });
     await publicClient.waitForTransactionReceipt({ hash });
-    log(`Approved aUSD: ${EXPLORER}/tx/${hash}`);
+    log(`Approved ${aUSD(q.premium)}: ${EXPLORER}/tx/${hash}`);
   }
 
   const hash = await walletClient.writeContract({ address: FLIGHTGUARD, abi, functionName: 'buyPolicy', args: [q, signature] });
