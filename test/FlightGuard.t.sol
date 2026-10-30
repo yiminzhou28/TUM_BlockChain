@@ -30,8 +30,9 @@ contract FlightGuardTest is AirnodeV2Test {
     TestUSD usd;
     FlightGuard guard;
 
-    // From the TypeScript deriveRequestHash in src/airnode-v2.ts, the same function the Airnode uses.
-    bytes32 constant LH400_20261029_HASH = 0xfe16d3138b8fc6a7b11c0ed222fee3bc10c00f6062f4037362e944134a63940b;
+    // From the TypeScript deriveRequestHash in src/airnode-v2.ts, the same function the Airnode uses, for
+    // flightStatusOnDate LH400 2026-10-29 with dateLocalRole Departure and the three-field projection.
+    bytes32 constant LH400_20261029_HASH = 0xa15da25eb629cf246d838db2dfb6f5794ffa31205d402430db0469c5038aad03;
 
     // Landed 2026-10-29 18:39Z, so the response is signed a little after that.
     uint256 constant SIGNED_AT = 1793300000;
@@ -141,6 +142,54 @@ contract FlightGuardTest is AirnodeV2Test {
         vm.warp(q.validUntil + 1);
         vm.prank(traveller);
         vm.expectRevert(FlightGuard.QuoteExpired.selector);
+        guard.buyPolicy(q, sig);
+    }
+
+    // The last flight on 2026-10-29 can depart at 24:00 in UTC-12, which is 2026-10-30 12:00 UTC.
+    uint256 constant LATEST_DEPARTURE_20261029 = 1793361600;
+
+    function test_LatestDepartureIs24h00InTheLatestTimeZone() public view {
+        assertEq(guard.latestDepartureAt("2026-10-29"), LATEST_DEPARTURE_20261029);
+    }
+
+    function test_RevertWhen_BuyingAfterTheUnderwritersCutOff() public {
+        // The underwriter's agent sets validUntil before the scheduled departure, here 2026-10-29 09:00 UTC
+        FlightGuard.Quote memory q = quoteFor("LH400", "2026-10-29", 1);
+        q.validUntil = 1793264400;
+        bytes memory sig = signQuote(q, UNDERWRITER_KEY);
+        vm.warp(1793264400 + 1);
+        vm.prank(traveller);
+        vm.expectRevert(FlightGuard.QuoteExpired.selector);
+        guard.buyPolicy(q, sig);
+    }
+
+    function test_RevertWhen_TravellerExtendsTheCutOff() public {
+        FlightGuard.Quote memory q = quoteFor("LH400", "2026-10-29", 1);
+        q.validUntil = 1793264400;
+        bytes memory sig = signQuote(q, UNDERWRITER_KEY);
+        q.validUntil = 1793300000; // after landing
+        vm.warp(1793264400 + 1);
+        vm.prank(traveller);
+        vm.expectRevert(FlightGuard.InvalidQuoteSignature.selector);
+        guard.buyPolicy(q, sig);
+    }
+
+    function test_CanBuyOneSecondBeforeLatestDeparture() public {
+        vm.warp(LATEST_DEPARTURE_20261029 - 1);
+        FlightGuard.Quote memory q = quoteFor("LH400", "2026-10-29", 1);
+        bytes memory sig = signQuote(q, UNDERWRITER_KEY);
+        vm.prank(traveller);
+        guard.buyPolicy(q, sig);
+        assertEq(guard.policyCount(), 1);
+    }
+
+    function test_RevertWhen_BuyingAfterLatestDepartureEvenWithALongQuote() public {
+        vm.warp(LATEST_DEPARTURE_20261029);
+        FlightGuard.Quote memory q = quoteFor("LH400", "2026-10-29", 1);
+        q.validUntil = block.timestamp + 30 days; // an underwriter mistake
+        bytes memory sig = signQuote(q, UNDERWRITER_KEY);
+        vm.prank(traveller);
+        vm.expectRevert(abi.encodeWithSelector(FlightGuard.TooLateToBuy.selector, LATEST_DEPARTURE_20261029));
         guard.buyPolicy(q, sig);
     }
 

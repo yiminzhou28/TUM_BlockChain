@@ -43,7 +43,7 @@ contract FlightGuard {
         uint256 premium;
         uint256 payout;
         uint256 delayThresholdMinutes;
-        uint256 validUntil; // Unix seconds after which the quote cannot be used
+        uint256 validUntil; // Unix seconds after which the quote cannot be used, set before the scheduled departure
         uint256 nonce;
     }
 
@@ -86,6 +86,7 @@ contract FlightGuard {
     error FlightNotArrived(string status);
     error SettlementWindowOpen(uint256 settleBy);
     error NotUnderwriter();
+    error TooLateToBuy(uint256 latestDeparture);
 
     constructor(address airnode_, IERC20 token_, address underwriter_) {
         airnode = airnode_;
@@ -99,6 +100,11 @@ contract FlightGuard {
     function buyPolicy(Quote calldata quote, bytes calldata underwriterSignature) external returns (uint256 policyId) {
         if (msg.sender != quote.holder) revert NotQuoteHolder();
         if (block.timestamp > quote.validUntil) revert QuoteExpired();
+        // The underwriter sets validUntil from the flight's scheduled departure, before which it must be bought, and signs
+        // it, so the traveller cannot insure a flight that has already departed. As a backstop the contract refuses any
+        // purchase after the last moment a flight on that local date could depart anywhere on Earth.
+        uint256 latestDeparture = latestDepartureAt(quote.dateLocal);
+        if (block.timestamp >= latestDeparture) revert TooLateToBuy(latestDeparture);
         bytes32 quoteHash = hashQuote(quote);
         if (usedQuotes[quoteHash]) revert QuoteAlreadyUsed();
         if (ECDSA.recover(MessageHashUtils.toEthSignedMessageHash(quoteHash), underwriterSignature) != underwriter) {
@@ -126,6 +132,14 @@ contract FlightGuard {
             })
         );
         emit PolicyBought(policyId, quote.holder, quote.flightNumber, quote.dateLocal, quote.premium, quote.payout);
+    }
+
+    /// @notice The last moment a flight on a local departure date can depart: 24:00 of that date in UTC-12, the
+    /// latest time zone on Earth, which is 36 hours after 00:00 UTC of the date.
+    /// @dev A backstop only. The real cut-off is the quote's validUntil, which the underwriter sets before the
+    /// scheduled departure of the flight.
+    function latestDepartureAt(string calldata dateLocal) public pure returns (uint256) {
+        return IsoTimestamp.parse(dateLocal) + 36 hours;
     }
 
     /// @notice What the underwriter signs, with EIP-191. Binds the quote to this contract and this chain.
@@ -210,9 +224,11 @@ contract FlightGuard {
 
     // ---------------------------------------------------------------- request hash
 
-    /// @notice The hash of the AeroDataBox request for a flight on a date, built the way the Airnode builds it:
+    /// @notice The hash of the AeroDataBox request for a flight departing on a date, built the way the Airnode builds it:
     /// keccak256(JSON.stringify([operation, parameterEntriesSortedByName, projectionEntriesSortedByName]))
     /// @dev Building it here means the traveller cannot buy a policy for one flight and settle it with another.
+    /// dateLocalRole is pinned to Departure: with the default (Both), the date could also match the arrival date of an
+    /// overnight flight that departed the day before, after sales closed for its real departure date.
     function deriveRequestHash(string memory flightNumber, string memory dateLocal) public pure returns (bytes32) {
         _checkFlightNumber(flightNumber);
         _checkDate(dateLocal);
@@ -221,7 +237,7 @@ contract FlightGuard {
                 string.concat(
                     '["flightStatusOnDate",[["dateLocal","',
                     dateLocal,
-                    '"],["searchBy","number"],["searchParam","',
+                    '"],["dateLocalRole","Departure"],["searchBy","number"],["searchParam","',
                     flightNumber,
                     '"]],',
                     PROJECTION,

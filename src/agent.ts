@@ -5,6 +5,7 @@
 //   node --env-file=.env src/agent.ts buy
 //   node --env-file=.env src/agent.ts keeper
 //   node --env-file=.env src/agent.ts status
+//   node --env-file=.env src/agent.ts withdraw
 import { readFileSync, writeFileSync } from 'node:fs';
 import {
   type Address,
@@ -23,7 +24,7 @@ import { type AirnodeV2Request, fetchSignedResponse, type SignedResponse, verify
 import { AERODATABOX_ADDRESS, AERODATABOX_URL, deriveFlightRequestHash, fetchSignedFlight } from './flight.ts';
 import { createScriptFetch } from './script-options.ts';
 
-const FLIGHTGUARD = (process.env.FLIGHTGUARD_ADDRESS ?? '0x1Ff69Fd5D73cA61095421E6c67aDB5AF0479976A') as Address;
+const FLIGHTGUARD = (process.env.FLIGHTGUARD_ADDRESS ?? '0xE12a3238ca345b45d34D4A8E9A244228EdfcBc73') as Address;
 const AUSD: Address = '0xbeA34973e5f67F18F656A2C6070C64326C791808';
 const RPC = process.env.BASE_SEPOLIA_RPC ?? 'https://sepolia.base.org';
 const EXPLORER = process.env.EXPLORER ?? 'https://sepolia.basescan.org';
@@ -76,20 +77,53 @@ export const priceFromHistory = (delays: number[], thresholdMinutes: number, pay
   return { n, k, probability, premium };
 };
 
-async function quote(flightNumber: string, dateLocal: string, payoutText = '2', thresholdText = '120', daysText = '5') {
+async function quote(flightText: string, dateLocal: string, payoutText = '2', thresholdText = '120', daysText = '5') {
+  const flightNumber = flightText.toUpperCase().replace(/\s/g, '');
+  if (!/^[A-Z0-9]{3,8}$/.test(flightNumber)) throw new Error(`Flight number ${flightText} is not like LH400`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateLocal)) throw new Error(`Date ${dateLocal} is not YYYY-MM-DD`);
   const payout = parseUnits(payoutText, 6);
   const threshold = Number(thresholdText);
   const days = Number(daysText);
   const payingFetch = createScriptFetch();
 
+  // 1. Is the flight still sellable? Buy its schedule for that date and stop if it has departed, is already known to
+  //    be late, or leaves within SALES_CLOSE_BEFORE_DEPARTURE. The quote expires before the scheduled departure, and
+  //    the contract enforces that expiry, so a traveller can never buy cover once the flight is under way.
+  const SALES_CLOSE_BEFORE_DEPARTURE = 2 * 3600;
+  const SELLABLE_STATUSES = ['Expected', 'Unknown', 'CheckIn'];
+  log(`Checking the schedule of ${flightNumber} departing ${dateLocal} (0.05 aUSD)`);
+  const schedule = await fetchSignedResponse(
+    AERODATABOX_URL,
+    {
+      operation: 'flightStatusOnDate',
+      parameters: { searchBy: 'number', searchParam: flightNumber, dateLocal, dateLocalRole: 'Departure' },
+    },
+    payingFetch
+  );
+  const flight = schedule.data ? JSON.parse(schedule.data)[0] : undefined;
+  const scheduledDeparture = flight?.departure?.scheduledTime?.utc;
+  if (!flight || !scheduledDeparture) throw new Error(`AeroDataBox has no ${flightNumber} departing ${dateLocal}`);
+  const departureAt = Math.floor(parseUtc(scheduledDeparture) / 1000);
+  const revisedDeparture = flight.departure?.revisedTime?.utc;
+  const knownDelayMinutes = revisedDeparture ? Math.round((parseUtc(revisedDeparture) - departureAt * 1000) / 60_000) : 0;
+  log(`  ${flight.departure.airport?.iata} -> ${flight.arrival?.airport?.iata}, departs ${scheduledDeparture}, status ${flight.status}`);
+  if (!SELLABLE_STATUSES.includes(flight.status)) throw new Error(`Not selling: status is ${flight.status}`);
+  if (knownDelayMinutes >= 15) throw new Error(`Not selling: departure already revised ${knownDelayMinutes} min late`);
+  const now = Math.floor(Date.now() / 1000);
+  const salesClose = departureAt - SALES_CLOSE_BEFORE_DEPARTURE;
+  if (now >= salesClose) {
+    throw new Error(`Not selling: sales closed at ${new Date(salesClose * 1000).toISOString()}, 2 h before departure`);
+  }
+
   log(`Pricing ${flightNumber} on ${dateLocal}: payout ${aUSD(payout)} if ${threshold}+ min late`);
+  // 2. Price it from the flight's recent history.
   log(`Buying ${days} days of history from AeroDataBox over x402 (0.05 aUSD per call)`);
   const delays: number[] = [];
   for (let i = 1; i <= days; i++) {
     const day = shiftDate(dateLocal, -i);
     const request: AirnodeV2Request = {
       operation: 'flightStatusOnDate',
-      parameters: { searchBy: 'number', searchParam: flightNumber, dateLocal: day },
+      parameters: { searchBy: 'number', searchParam: flightNumber, dateLocal: day, dateLocalRole: 'Departure' },
     };
     try {
       const signed = await fetchSignedResponse(AERODATABOX_URL, request, payingFetch);
@@ -112,7 +146,7 @@ async function quote(flightNumber: string, dateLocal: string, payoutText = '2', 
     premium,
     payout,
     delayThresholdMinutes: BigInt(threshold),
-    validUntil: BigInt(Math.floor(Date.now() / 1000) + 3600),
+    validUntil: BigInt(Math.min(now + 3600, salesClose - 1)),
     nonce: BigInt(Date.now()),
   };
   const quoteHash = (await publicClient.readContract({
@@ -127,7 +161,7 @@ async function quote(flightNumber: string, dateLocal: string, payoutText = '2', 
     JSON.stringify({ quote: q, signature, pricing: { observed: n, delayed: k, probability } }, (_, v) =>
       typeof v === 'bigint' ? v.toString() : v, 2)
   );
-  log(`Signed quote saved to ${QUOTE_FILE}`);
+  log(`Signed quote saved to ${QUOTE_FILE}, valid until ${new Date(Number(q.validUntil) * 1000).toISOString()}`);
 }
 
 // ---------------------------------------------------------------- buying
@@ -232,6 +266,15 @@ async function status() {
   }
 }
 
+/** The underwriter takes back everything in the pool that is not reserved for active policies */
+async function withdraw() {
+  const available = (await publicClient.readContract({ address: FLIGHTGUARD, abi, functionName: 'availableLiquidity' })) as bigint;
+  if (available === 0n) return log('Nothing to withdraw');
+  const hash = await walletClient.writeContract({ address: FLIGHTGUARD, abi, functionName: 'withdraw', args: [available] });
+  await publicClient.waitForTransactionReceipt({ hash });
+  log(`Withdrew ${aUSD(available)} from ${FLIGHTGUARD}: ${EXPLORER}/tx/${hash}`);
+}
+
 // ---------------------------------------------------------------- main
 
 if (import.meta.main) {
@@ -240,5 +283,6 @@ if (import.meta.main) {
   else if (command === 'buy') await buy();
   else if (command === 'keeper') await keeper(args[0] === '--file' ? args[1] : undefined);
   else if (command === 'status') await status();
-  else console.log('Usage: src/agent.ts quote <flight> <YYYY-MM-DD> [payout] [threshold min] [days] | buy | keeper | status');
+  else if (command === 'withdraw') await withdraw();
+  else console.log('Usage: src/agent.ts quote <flight> <YYYY-MM-DD> [payout] [threshold min] [days] | buy | keeper | status | withdraw');
 }

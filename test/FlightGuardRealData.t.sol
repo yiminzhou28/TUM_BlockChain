@@ -9,7 +9,7 @@ import {TestUSD} from "./FlightGuard.t.sol";
 import {AirnodeV2Test} from "./utils/AirnodeV2Test.sol";
 
 /// @notice Settles a policy with a response that the real AeroDataBox Airnode signed, saved by src/fetch-flight.ts.
-/// LH400 FRA-JFK on 2026-10-29 arrived 18:39Z against 18:35Z scheduled, 4 minutes late.
+/// LH400 FRA-JFK departing 2026-10-29 arrived 18:39Z against 18:35Z scheduled, 4 minutes late.
 contract FlightGuardRealDataTest is AirnodeV2Test {
     address constant AERODATABOX_AIRNODE = 0x83FE2E8F24E66520B1902C3507De4F471248f2Ec;
     uint256 constant UNDERWRITER_KEY = 0xB0B;
@@ -35,7 +35,7 @@ contract FlightGuardRealDataTest is AirnodeV2Test {
         usd.mint(traveller, 100e6);
         vm.prank(traveller);
         usd.approve(address(guard), type(uint256).max);
-        vm.warp(timestamp - 2 days);
+        vm.warp(1793100000); // 2026-10-27 12:40 UTC, before sales close for 2026-10-29
     }
 
     function buy(uint256 thresholdMinutes) internal returns (uint256) {

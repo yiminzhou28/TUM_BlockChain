@@ -11,7 +11,7 @@ Built for the API3 AirnodeHub track of the TUM Blockchain & AI Hackathon 2026.
 | | |
 | --- | --- |
 | Network | Base Sepolia (chain id 84532) |
-| FlightGuard contract | [`0x1Ff69Fd5D73cA61095421E6c67aDB5AF0479976A`](https://sepolia.basescan.org/address/0x1Ff69Fd5D73cA61095421E6c67aDB5AF0479976A) |
+| FlightGuard contract | [`0xE12a3238ca345b45d34D4A8E9A244228EdfcBc73`](https://sepolia.basescan.org/address/0xE12a3238ca345b45d34D4A8E9A244228EdfcBc73) |
 | Data source | [AeroDataBox on AirnodeHub](https://airnodehub.api3.org/explore/aerodatabox), `flightStatusOnDate` |
 | AeroDataBox Airnode signer | `0x83FE2E8F24E66520B1902C3507De4F471248f2Ec` |
 | Payment token | aUSD `0xbeA34973e5f67F18F656A2C6070C64326C791808` |
@@ -49,7 +49,7 @@ The contract recovers the signer itself, so it can pay out without trusting the 
 1. **The signer.** `AirnodeV2Attestation.verify` recovers the address that signed and compares it with the AeroDataBox
    Airnode address stored in the contract. The `airnode` field of the response is never trusted.
 2. **The request.** The contract builds the request hash itself from the policy's flight number and date
-   (`deriveRequestHash`), the same way the Airnode does. That hash goes into the signed digest, so a real response for
+   (`deriveRequestHash`), the same way the Airnode does, with `dateLocalRole: Departure`. That hash goes into the signed digest, so a real response for
    another flight or another date recovers a different signer and reverts.
 3. **The time.** The signed `timestamp` must be at most `MAX_RESPONSE_AGE` (1 hour) old.
 
@@ -69,6 +69,21 @@ Beta(1,1) prior so a short history never gives a zero price:
 P(delay) = (k + 1) / (n + 2)
 premium  = payout × P(delay) × 1.2        (20 % margin, minimum 0.05 aUSD)
 ```
+
+### No cover after departure
+
+A traveller must never be able to insure a flight that is already late. FlightGuard closes sales before departure in
+two layers:
+
+1. **The underwriter's cut-off.** Before quoting, the agent buys the flight's schedule for that date. It refuses if
+   the status is not `Expected`, `Unknown` or `CheckIn`, if the departure is already revised 15+ minutes late, or if
+   departure is less than 2 hours away. The quote's `validUntil` is at most 2 hours before the scheduled departure.
+   The underwriter signs it and the contract enforces it, so the traveller cannot extend it.
+2. **The contract's backstop.** Whatever the quote says, `buyPolicy` reverts after `latestDepartureAt(dateLocal)`,
+   24:00 of that date in UTC-12, the last moment any flight on that local date can depart.
+
+The request also pins `dateLocalRole` to `Departure`. With AeroDataBox's default (`Both`), a date can match the
+*arrival* date of an overnight flight that departed the day before.
 
 ### Other safeguards
 
@@ -125,7 +140,7 @@ All commands run from the project folder.
 forge test --match-contract FlightGuard
 ```
 
-22 tests: buying, settling, the pool, and the four tamper cases (edited value, too old, another request, wrong key).
+27 tests: buying and its cut-offs, settling, the pool, and the four tamper cases (edited value, too old, another request, wrong key).
 `FlightGuardRealData.t.sol` settles policies with a response that the real AeroDataBox Airnode signed
 (`test/fixtures/flight-LH400-2026-10-29.json`).
 
@@ -162,18 +177,24 @@ node --env-file=.env src/agent.ts status
 
 | Command | What it does |
 | --- | --- |
-| `quote` | Buys `history days` (default 5) of the flight's history over x402, estimates the delay probability, prices the policy and signs a quote as underwriter. Saves it to `quote.json`. Defaults: payout 2 aUSD, threshold 120 minutes. |
+| `quote` | Checks the flight's schedule for that date and refuses if it has departed, is already late or leaves within 2 hours. Then buys `history days` (default 5) of the flight's history over x402, estimates the delay probability, prices the policy and signs a quote as underwriter, valid for 1 hour and never past 2 hours before departure. Saves it to `quote.json`. Defaults: payout 2 aUSD, threshold 120 minutes. |
 | `buy` | Approves aUSD if needed and buys the policy in `quote.json`. |
 | `keeper` | For every active policy, fetches the signed flight status over x402, verifies it off-chain, and calls `settle`. Skips flights that have not landed yet. `keeper --file <response.json>` submits a saved response instead. |
 | `status` | Shows the pool, the reserved amount and every policy with its status. |
+| `withdraw` | Underwriter only: takes back everything in the pool that is not reserved for active policies. |
 
 ## Demo
 
+Insure a flight that has not departed yet, then settle it after it lands:
+
 ```sh
-node --env-file=.env src/agent.ts quote LH400 2026-10-29 2 3 5   # price: payout 2 aUSD if 3+ min late
-node --env-file=.env src/agent.ts buy                            # buy the policy
-node --env-file=.env src/agent.ts keeper                         # LH400 landed 4 min late -> pays out
-node --env-file=.env src/agent.ts status                         # policy shows PaidOut
+# Before departure (at least 2 h): price and buy, payout 1 aUSD if 15+ min late
+node --env-file=.env src/agent.ts quote <flight> <YYYY-MM-DD> 1 15 5
+node --env-file=.env src/agent.ts buy
+
+# After landing: the keeper settles every active policy with signed AeroDataBox data
+node --env-file=.env src/agent.ts keeper
+node --env-file=.env src/agent.ts status
 ```
 
 ## Files
@@ -191,13 +212,15 @@ node --env-file=.env src/agent.ts status                         # policy shows 
 
 ## Limitations and next steps
 
-- **The demo insures a flight that has already landed**, so settlement can be shown live. In production the underwriter
-  agent would only quote flights that have not departed; the contract would also check that `dateLocal` is in the
-  future at purchase time.
-- In the demo the underwriter and the traveller are the same wallet. They are separate roles in the contract.
-- AeroDataBox returns a list when one flight number has several legs; the projection reads the first one.
+- **Cancelled and diverted flights are not covered.** They never reach `Arrived`, so they cannot settle; the policy
+  expires after 3 days and the reserve returns to the pool. Covering them needs a second projection on the status.
 - If AeroDataBox has no `revisedTime` for an arrival, the projected request fails and the policy can only expire.
   A second projection on `runwayTime` would cover that case.
+- AeroDataBox returns a list when one flight number has several legs; the projection reads the first one.
+- Settlement uses the first `Arrived` response that anyone submits within its one-hour freshness window.
+- The Airnode signature proves that the data came from the AeroDataBox Airnode, not that AeroDataBox is right. That is
+  the same trust any delay insurance places in its flight data provider.
+- In the demo the underwriter and the traveller are the same wallet. They are separate roles in the contract.
 - The pricing model uses only the same flight's recent history. Route, airport and weather data from other AirnodeHub
   listings would sharpen it.
 
