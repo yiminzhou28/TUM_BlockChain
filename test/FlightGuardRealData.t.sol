@@ -85,4 +85,24 @@ contract FlightGuardRealDataTest is AirnodeV2Test {
         vm.expectRevert(abi.encodeWithSelector(FlightGuard.ResponseTooOld.selector, timestamp));
         guard.settle(id, timestamp, data, signature);
     }
+
+    /// @notice The status request with a response that the real AeroDataBox Airnode signed, saved by
+    /// `src/fetch-flight.ts LH400 2026-10-29 --status`. The real signature verifies against the request hash that the
+    /// contract builds, and since LH400 arrived, the cancellation path refuses it.
+    function test_RealStatusResponse_VerifiesButDoesNotPayAnArrivedFlight() public {
+        string memory path = "test/fixtures/status-LH400-2026-10-29.json";
+        // forge-lint: disable-next-line(unsafe-cheatcode)
+        if (!vm.exists(path)) vm.skip(true, "run src/fetch-flight.ts LH400 2026-10-29 --status first");
+        // forge-lint: disable-next-line(unsafe-cheatcode)
+        string memory json = vm.readFile(path);
+        assertEq(vm.parseJsonBytes32(json, ".requestHash"), guard.deriveStatusRequestHash("LH400", "2026-10-29"));
+        uint256 statusTimestamp = vm.parseJsonUint(json, ".timestamp");
+        bytes memory statusData = bytes(vm.parseJsonString(json, ".data"));
+        bytes memory statusSignature = vm.parseJsonBytes(json, ".signature");
+
+        uint256 id = buy(120);
+        vm.warp(statusTimestamp + 60);
+        vm.expectRevert(abi.encodeWithSelector(FlightGuard.FlightNotCancelledOrDiverted.selector, "Arrived"));
+        guard.settleCancelledOrDiverted(id, statusTimestamp, statusData, statusSignature);
+    }
 }

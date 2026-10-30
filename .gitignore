@@ -11,3 +11,6 @@ node_modules
 /quote.json
 /aerodatabox.json
 /flight-*.json
+# Agent state: history it bought and scheduled arrivals it watches for
+/flight-history.json
+/schedule.json

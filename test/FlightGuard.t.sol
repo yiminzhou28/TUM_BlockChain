@@ -285,6 +285,125 @@ contract FlightGuardTest is AirnodeV2Test {
         guard.settle(id, SIGNED_AT, DELAYED_DATA, sig);
     }
 
+    // ------------------------------------------------------------ cancelled and diverted flights
+
+    // From the TypeScript deriveRequestHash, for the same flight and date with the status-only projection.
+    bytes32 constant LH400_20261029_STATUS_HASH = 0x1a8421d7312811a8abed3430641c29274848fb61467ab86c554378dad3a1fdc1;
+
+    function settleStatus(uint256 id, uint256 key, bytes32 requestHash, bytes memory signedData, bytes memory submittedData)
+        internal
+    {
+        bytes memory sig = signResponse(key, requestHash, SIGNED_AT, signedData);
+        guard.settleCancelledOrDiverted(id, SIGNED_AT, submittedData, sig);
+    }
+
+    function test_DerivesTheSameStatusRequestHashAsTheAirnode() public view {
+        assertEq(guard.deriveStatusRequestHash("LH400", "2026-10-29"), LH400_20261029_STATUS_HASH);
+        assertTrue(LH400_20261029_STATUS_HASH != LH400_20261029_HASH);
+    }
+
+    function test_PaysOutWhenCancelled() public {
+        uint256 id = buyLH400();
+        vm.warp(SIGNED_AT + 10);
+        bytes memory data = bytes('{"status":"Canceled"}');
+        vm.expectEmit(address(guard));
+        emit FlightGuard.PolicyPaidForNoArrival(id, "Canceled", 100e6);
+        settleStatus(id, AIRNODE_KEY, LH400_20261029_STATUS_HASH, data, data);
+
+        assertEq(usd.balanceOf(traveller), 195e6);
+        assertEq(guard.totalReserved(), 0);
+        (,,,,, FlightGuard.Status status,,) = guard.policies(id);
+        assertEq(uint256(status), uint256(FlightGuard.Status.PaidOut));
+    }
+
+    function test_PaysOutWhenDiverted() public {
+        uint256 id = buyLH400();
+        vm.warp(SIGNED_AT + 10);
+        bytes memory data = bytes('{"status":"Diverted"}');
+        settleStatus(id, AIRNODE_KEY, LH400_20261029_STATUS_HASH, data, data);
+        assertEq(usd.balanceOf(traveller), 195e6);
+    }
+
+    function test_RevertWhen_StatusIsNotCancelledOrDiverted() public {
+        uint256 id = buyLH400();
+        vm.warp(SIGNED_AT + 10);
+        string[4] memory others = ["Arrived", "CanceledUncertain", "Delayed", "EnRoute"];
+        for (uint256 i; i < others.length; i++) {
+            bytes memory data = bytes(string.concat('{"status":"', others[i], '"}'));
+            bytes memory sig = signResponse(AIRNODE_KEY, LH400_20261029_STATUS_HASH, SIGNED_AT, data);
+            vm.expectRevert(abi.encodeWithSelector(FlightGuard.FlightNotCancelledOrDiverted.selector, others[i]));
+            guard.settleCancelledOrDiverted(id, SIGNED_AT, data, sig);
+        }
+    }
+
+    function test_RevertWhen_CancelledPolicySettledAgain() public {
+        uint256 id = buyLH400();
+        vm.warp(SIGNED_AT + 10);
+        bytes memory data = bytes('{"status":"Canceled"}');
+        settleStatus(id, AIRNODE_KEY, LH400_20261029_STATUS_HASH, data, data);
+        bytes memory sig = signResponse(AIRNODE_KEY, LH400_20261029_STATUS_HASH, SIGNED_AT, data);
+        vm.expectRevert(abi.encodeWithSelector(FlightGuard.PolicyNotActive.selector, id));
+        guard.settleCancelledOrDiverted(id, SIGNED_AT, data, sig);
+        vm.expectRevert(abi.encodeWithSelector(FlightGuard.PolicyNotActive.selector, id));
+        guard.settle(id, SIGNED_AT, ON_TIME_DATA, signResponse(AIRNODE_KEY, LH400_20261029_HASH, SIGNED_AT, ON_TIME_DATA));
+    }
+
+    // The four tamper cases on the cancellation path
+
+    function test_RevertWhen_StatusEditedToCancelled() public {
+        uint256 id = buyLH400();
+        vm.warp(SIGNED_AT + 10);
+        vm.expectPartialRevert(AirnodeV2Attestation.NotSignedByAirnode.selector);
+        settleStatus(id, AIRNODE_KEY, LH400_20261029_STATUS_HASH, bytes('{"status":"Arrived"}'), bytes('{"status":"Canceled"}'));
+    }
+
+    function test_RevertWhen_CancellationIsTooOld() public {
+        uint256 id = buyLH400();
+        bytes memory data = bytes('{"status":"Canceled"}');
+        bytes memory sig = signResponse(AIRNODE_KEY, LH400_20261029_STATUS_HASH, SIGNED_AT, data);
+        vm.warp(SIGNED_AT + guard.MAX_RESPONSE_AGE() + 1);
+        vm.expectRevert(abi.encodeWithSelector(FlightGuard.ResponseTooOld.selector, SIGNED_AT));
+        guard.settleCancelledOrDiverted(id, SIGNED_AT, data, sig);
+    }
+
+    function test_RevertWhen_CancellationIsForAnotherFlightOrDate() public {
+        uint256 id = buyLH400();
+        vm.warp(SIGNED_AT + 10);
+        bytes memory data = bytes('{"status":"Canceled"}');
+        bytes32 anotherFlight = guard.deriveStatusRequestHash("LH401", "2026-10-29");
+        bytes32 anotherDate = guard.deriveStatusRequestHash("LH400", "2026-10-28");
+        vm.expectPartialRevert(AirnodeV2Attestation.NotSignedByAirnode.selector);
+        settleStatus(id, AIRNODE_KEY, anotherFlight, data, data);
+        vm.expectPartialRevert(AirnodeV2Attestation.NotSignedByAirnode.selector);
+        settleStatus(id, AIRNODE_KEY, anotherDate, data, data);
+    }
+
+    function test_RevertWhen_CancellationSignedWithWrongKey() public {
+        uint256 id = buyLH400();
+        vm.warp(SIGNED_AT + 10);
+        bytes memory data = bytes('{"status":"Canceled"}');
+        vm.expectRevert(abi.encodeWithSelector(AirnodeV2Attestation.NotSignedByAirnode.selector, vm.addr(0xDEAD)));
+        settleStatus(id, 0xDEAD, LH400_20261029_STATUS_HASH, data, data);
+    }
+
+    // A response to one request cannot be used on the other path
+
+    function test_RevertWhen_ArrivalResponseUsedOnCancellationPath() public {
+        uint256 id = buyLH400();
+        vm.warp(SIGNED_AT + 10);
+        bytes memory data = bytes('{"status":"Canceled"}');
+        vm.expectPartialRevert(AirnodeV2Attestation.NotSignedByAirnode.selector);
+        settleStatus(id, AIRNODE_KEY, LH400_20261029_HASH, data, data);
+    }
+
+    function test_RevertWhen_StatusResponseUsedOnArrivalPath() public {
+        uint256 id = buyLH400();
+        vm.warp(SIGNED_AT + 10);
+        bytes memory sig = signResponse(AIRNODE_KEY, LH400_20261029_STATUS_HASH, SIGNED_AT, DELAYED_DATA);
+        vm.expectPartialRevert(AirnodeV2Attestation.NotSignedByAirnode.selector);
+        guard.settle(id, SIGNED_AT, DELAYED_DATA, sig);
+    }
+
     // ------------------------------------------------------------ pool and expiry
 
     function test_UnderwriterCannotWithdrawReservedFunds() public {

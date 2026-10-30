@@ -9,11 +9,12 @@ import {AirnodeV2Attestation} from "./AirnodeV2Attestation.sol";
 import {IsoTimestamp} from "./IsoTimestamp.sol";
 import {ProjectedJson} from "./ProjectedJson.sol";
 
-/// @title FlightGuard: parametric flight delay insurance settled by signed AeroDataBox data
+/// @title FlightGuard: parametric flight delay, cancellation and diversion insurance settled by signed AeroDataBox data
 /// @notice An underwriter agent prices a policy and signs a quote. The traveller buys it with the quote. After the flight
 /// lands, anyone (usually a keeper agent) submits the AeroDataBox response that the Airnode signed, and the contract
-/// pays out if the flight arrived at least `delayThresholdMinutes` late. Nobody has to trust whoever submits the data:
-/// the contract checks that the AeroDataBox Airnode signed it, for exactly this flight on exactly this date.
+/// pays out if the flight arrived at least `delayThresholdMinutes` late. If the flight is cancelled or diverted, the
+/// signed status of the flight pays out instead. Nobody has to trust whoever submits the data: the contract checks that
+/// the AeroDataBox Airnode signed it, for exactly this flight on exactly this date.
 contract FlightGuard {
     using SafeERC20 for IERC20;
 
@@ -32,9 +33,13 @@ contract FlightGuard {
     /// @notice After this long past the flight date, an unsettled policy can be expired and its reserve released
     uint256 public constant SETTLEMENT_WINDOW = 3 days;
 
-    // The projection the request hash commits to. Pointers into the first (operating) flight of the list.
+    // The projection of the arrival request. Pointers into the first (operating) flight of the list.
     string private constant PROJECTION =
         '[["actualArrival","/0/arrival/revisedTime/utc"],["scheduledArrival","/0/arrival/scheduledTime/utc"],["status","/0/status"]]';
+
+    // The projection of the status request: only the status, which a cancelled or diverted flight still has, while it
+    // has no actual arrival time for the arrival request to point at.
+    string private constant STATUS_PROJECTION = '[["status","/0/status"]]';
 
     struct Quote {
         address holder;
@@ -72,6 +77,7 @@ contract FlightGuard {
 
     event PolicyBought(uint256 indexed policyId, address indexed holder, string flightNumber, string dateLocal, uint256 premium, uint256 payout);
     event PolicySettled(uint256 indexed policyId, Status status, uint256 delayMinutes, uint256 paid);
+    event PolicyPaidForNoArrival(uint256 indexed policyId, string flightStatus, uint256 paid);
     event PolicyExpired(uint256 indexed policyId);
 
     error InvalidQuoteSignature();
@@ -84,6 +90,7 @@ contract FlightGuard {
     error PolicyNotActive(uint256 policyId);
     error ResponseTooOld(uint256 responseTimestamp);
     error FlightNotArrived(string status);
+    error FlightNotCancelledOrDiverted(string status);
     error SettlementWindowOpen(uint256 settleBy);
     error NotUnderwriter();
     error TooLateToBuy(uint256 latestDeparture);
@@ -194,7 +201,37 @@ contract FlightGuard {
         }
     }
 
-    /// @notice Releases the reserve of a policy that nobody settled in time, such as for a cancelled flight
+    /// @notice Pays out a policy whose flight was cancelled or diverted, with the signed AeroDataBox status of the flight.
+    /// Such a flight never arrives at its destination, so it has no actual arrival time and `settle` cannot be used.
+    /// Anyone can call it. CanceledUncertain does not count: AeroDataBox is not sure yet.
+    /// @param timestamp `timestamp` of the response to the status request
+    /// @param data `data` of that response, such as {"status":"Canceled"}
+    /// @param signature `signature` of that response
+    function settleCancelledOrDiverted(uint256 policyId, uint256 timestamp, bytes calldata data, bytes calldata signature)
+        external
+    {
+        Policy storage policy = policies[policyId];
+        if (policy.status != Status.Active) revert PolicyNotActive(policyId);
+
+        // The same three checks as settle, with the status request of this flight on this date
+        AirnodeV2Attestation.verify(
+            airnode, deriveStatusRequestHash(policy.flightNumber, policy.dateLocal), timestamp, data, signature
+        );
+        if (timestamp + MAX_RESPONSE_AGE < block.timestamp) revert ResponseTooOld(timestamp);
+        string memory flightStatus = ProjectedJson.readString(data, "status");
+        bytes32 statusHash = keccak256(bytes(flightStatus));
+        if (statusHash != keccak256("Canceled") && statusHash != keccak256("Diverted")) {
+            revert FlightNotCancelledOrDiverted(flightStatus);
+        }
+
+        totalReserved -= policy.payout;
+        policy.status = Status.PaidOut;
+        token.safeTransfer(policy.holder, policy.payout);
+        emit PolicyPaidForNoArrival(policyId, flightStatus, policy.payout);
+    }
+
+    /// @notice Releases the reserve of a policy that nobody settled in time, such as a flight whose arrival AeroDataBox
+    /// never reported
     function expire(uint256 policyId) external {
         Policy storage policy = policies[policyId];
         if (policy.status != Status.Active) revert PolicyNotActive(policyId);
@@ -224,12 +261,28 @@ contract FlightGuard {
 
     // ---------------------------------------------------------------- request hash
 
-    /// @notice The hash of the AeroDataBox request for a flight departing on a date, built the way the Airnode builds it:
-    /// keccak256(JSON.stringify([operation, parameterEntriesSortedByName, projectionEntriesSortedByName]))
-    /// @dev Building it here means the traveller cannot buy a policy for one flight and settle it with another.
-    /// dateLocalRole is pinned to Departure: with the default (Both), the date could also match the arrival date of an
-    /// overnight flight that departed the day before, after sales closed for its real departure date.
+    /// @notice The hash of the AeroDataBox arrival request for a flight departing on a date, which `settle` takes
     function deriveRequestHash(string memory flightNumber, string memory dateLocal) public pure returns (bytes32) {
+        return _deriveRequestHash(flightNumber, dateLocal, PROJECTION);
+    }
+
+    /// @notice The hash of the AeroDataBox status request for a flight departing on a date, which
+    /// `settleCancelledOrDiverted` takes
+    function deriveStatusRequestHash(string memory flightNumber, string memory dateLocal) public pure returns (bytes32) {
+        return _deriveRequestHash(flightNumber, dateLocal, STATUS_PROJECTION);
+    }
+
+    /// @dev Built the way the Airnode builds it:
+    /// keccak256(JSON.stringify([operation, parameterEntriesSortedByName, projectionEntriesSortedByName])).
+    /// Building it here means the traveller cannot buy a policy for one flight and settle it with another, and the two
+    /// projections give two different hashes, so a response to one request cannot be used for the other.
+    /// dateLocalRole is pinned to Departure: with the default (Both), the date could also match the arrival date of an
+    /// overnight flight that departed the day before.
+    function _deriveRequestHash(string memory flightNumber, string memory dateLocal, string memory projection)
+        private
+        pure
+        returns (bytes32)
+    {
         _checkFlightNumber(flightNumber);
         _checkDate(dateLocal);
         return keccak256(
@@ -240,7 +293,7 @@ contract FlightGuard {
                     '"],["dateLocalRole","Departure"],["searchBy","number"],["searchParam","',
                     flightNumber,
                     '"]],',
-                    PROJECTION,
+                    projection,
                     "]"
                 )
             )
