@@ -1,0 +1,101 @@
+{
+  "airnode": "0x83FE2E8F24E66520B1902C3507De4F471248f2Ec",
+  "requestHash": "0xdb8779907bae5cef29c936771f03a4146d14377823412821cd437d2ebc02e776",
+  "timestamp": "1793366120",
+  "data": [
+    {
+      "greatCircleDistance": {
+        "meter": 6204692.34,
+        "km": 6204.69,
+        "mile": 3855.42,
+        "nm": 3350.27,
+        "feet": 20356602.16
+      },
+      "departure": {
+        "airport": {
+          "icao": "EDDF",
+          "iata": "FRA",
+          "name": "Frankfurt-am-Main",
+          "shortName": "Frankfurt-am-Main",
+          "municipalityName": "Frankfurt-am-Main",
+          "location": {
+            "lat": 50.0264,
+            "lon": 8.543129
+          },
+          "countryCode": "DE",
+          "timeZone": "Europe/Berlin"
+        },
+        "scheduledTime": {
+          "utc": "2026-10-29 10:00Z",
+          "local": "2026-10-29 11:00+01:00"
+        },
+        "revisedTime": {
+          "utc": "2026-10-29 10:00Z",
+          "local": "2026-10-29 11:00+01:00"
+        },
+        "runwayTime": {
+          "utc": "2026-10-29 10:50Z",
+          "local": "2026-10-29 11:50+01:00"
+        },
+        "terminal": "1",
+        "checkInDesk": "259-335",
+        "gate": "Z66",
+        "runway": "07C",
+        "quality": [
+          "Basic",
+          "Live"
+        ]
+      },
+      "arrival": {
+        "airport": {
+          "icao": "KJFK",
+          "iata": "JFK",
+          "name": "New York John F Kennedy",
+          "shortName": "John F Kennedy",
+          "municipalityName": "New York",
+          "location": {
+            "lat": 40.6398,
+            "lon": -73.7789
+          },
+          "countryCode": "US",
+          "timeZone": "America/New_York"
+        },
+        "scheduledTime": {
+          "utc": "2026-10-29 18:35Z",
+          "local": "2026-10-29 14:35-04:00"
+        },
+        "revisedTime": {
+          "utc": "2026-10-29 18:39Z",
+          "local": "2026-10-29 14:39-04:00"
+        },
+        "runwayTime": {
+          "utc": "2026-10-29 18:31Z",
+          "local": "2026-10-29 14:31-04:00"
+        },
+        "terminal": "1",
+        "runway": "31R",
+        "quality": [
+          "Basic",
+          "Live"
+        ]
+      },
+      "lastUpdatedUtc": "2026-10-29 21:06Z",
+      "number": "LH 400",
+      "callSign": "DLH400",
+      "status": "Arrived",
+      "codeshareStatus": "IsOperator",
+      "isCargo": false,
+      "aircraft": {
+        "reg": "D-AIXC",
+        "modeS": "3C6703",
+        "model": "Airbus A350-900"
+      },
+      "airline": {
+        "name": "Lufthansa",
+        "iata": "LH",
+        "icao": "DLH"
+      }
+    }
+  ],
+  "signature": "0x35d2cae395bd7431ab130bf8577b35e780dd8b38c5fc50ab4e0025625429ad8d48e7ae278368a5d1ec23d8db7355ce01ba97380cbf1d838977dc1be49ac01c5a1c"
+}

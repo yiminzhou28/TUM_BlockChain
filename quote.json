@@ -1,0 +1,18 @@
+{
+  "quote": {
+    "holder": "0x1bd55B5D6ec5afbc34caf43A6173f1B40142e22b",
+    "flightNumber": "LH400",
+    "dateLocal": "2026-10-29",
+    "premium": "1371428",
+    "payout": "2000000",
+    "delayThresholdMinutes": "3",
+    "validUntil": "1793372486",
+    "nonce": "1793368886346"
+  },
+  "signature": "0x24c4493470cd67827f2a8c31395e6031eb7bccaf1bf07dd81c612c155a2c065a4dd6b5bdb0e1641ab542f58b19ce15ca4384519cda02415b734a1060527b4ce11c",
+  "pricing": {
+    "observed": 5,
+    "delayed": 3,
+    "probability": 0.5714285714285714
+  }
+}
