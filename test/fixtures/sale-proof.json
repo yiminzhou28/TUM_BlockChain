@@ -1,0 +1,9 @@
+{
+  "flightNumber": "LH109",
+  "dateLocal": "2026-10-31",
+  "airnode": "0x83FE2E8F24E66520B1902C3507De4F471248f2Ec",
+  "requestHash": "0x13ef607b77f3a74a77cb884ccb0279e5fb73593c65c16b91fbdef341f0931b17",
+  "timestamp": "1793436349",
+  "data": "{\"scheduledArrival\":\"2026-10-31 15:00Z\",\"scheduledDeparture\":\"2026-10-31 14:00Z\",\"status\":\"Expected\"}",
+  "signature": "0xffaaec9cf3d26ef85d5b62a123b4c7be4c6b2c3492ab732b65bf6a6b09f7b3b3756e0bccba129ac4baa28e75e85b39c966411c879171681690dda66bb4eb616e1b"
+}

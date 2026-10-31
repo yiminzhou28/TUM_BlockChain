@@ -76,15 +76,22 @@ export const MIN_OBSERVED_ARRIVALS = 2;
 
 /**
  * P(delay >= threshold) is the posterior mean (k + s * m) / (n + s) for a Beta prior with mean m and strength s.
- * Premium = payout * P * (1 + margin), at least MIN_PREMIUM.
+ * Premium = payout * P * (1 + margin), at least MIN_PREMIUM, plus the keeper reward that the contract pays to whoever
+ * settles the policy.
  */
-export const priceFromHistory = (delays: number[], thresholdMinutes: number, payout: bigint, prior = UNIFORM_PRIOR) => {
+export const priceFromHistory = (
+  delays: number[],
+  thresholdMinutes: number,
+  payout: bigint,
+  prior = UNIFORM_PRIOR,
+  keeperReward = 0n
+) => {
   const n = delays.length;
   const k = delays.filter((d) => d >= thresholdMinutes).length;
   const probability = (k + prior.strength * prior.mean) / (n + prior.strength);
-  let premium = (payout * BigInt(Math.round(probability * (1 + MARGIN) * 1e6))) / 1_000_000n;
-  if (premium < MIN_PREMIUM) premium = MIN_PREMIUM;
-  return { n, k, probability, premium };
+  const raw = (payout * BigInt(Math.round(probability * (1 + MARGIN) * 1e6))) / 1_000_000n;
+  const risk = raw < MIN_PREMIUM ? MIN_PREMIUM : raw;
+  return { n, k, probability, raw, risk, premium: risk + keeperReward };
 };
 
 /** Most of the pool that the payouts of one flight, and of all flights departing on one date, may take */
@@ -105,4 +112,31 @@ export const exposureProblem = (e: { pool: bigint; flightReserved: bigint; dateR
     return `cover on flights departing that date would exceed ${MAX_SHARE_PER_DATE * 100} % of the pool`;
   }
   return undefined;
+};
+
+/** A connection tighter than this cannot be insured: the slightest delay would already pay out */
+export const MIN_CONNECTION_BUFFER_MINUTES = 15;
+
+/**
+ * Self-transfer cover: two separately booked flights, where missing the second is the traveller's loss. The policy is
+ * a delay policy on the first flight whose threshold is the slack in the connection: the scheduled gap between the
+ * first flight's arrival and the second flight's departure, minus the time the traveller needs to change flights.
+ * Returns the threshold in minutes, or why the connection cannot be insured.
+ */
+export const connectionThreshold = (
+  scheduledArrival: string,
+  nextScheduledDeparture: string,
+  minConnectionMinutes: number
+) => {
+  const gapMinutes = Math.floor((parseUtc(nextScheduledDeparture) - parseUtc(scheduledArrival)) / 60_000);
+  const thresholdMinutes = gapMinutes - minConnectionMinutes;
+  if (Number.isNaN(gapMinutes)) return { problem: 'the schedule has no times to compare' };
+  if (gapMinutes <= 0) return { gapMinutes, problem: 'the second flight leaves before the first one arrives' };
+  if (thresholdMinutes < MIN_CONNECTION_BUFFER_MINUTES) {
+    return {
+      gapMinutes,
+      problem: `a ${gapMinutes} min connection leaves less than ${MIN_CONNECTION_BUFFER_MINUTES} min of slack after the ${minConnectionMinutes} min needed to change`,
+    };
+  }
+  return { gapMinutes, thresholdMinutes };
 };

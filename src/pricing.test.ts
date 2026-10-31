@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { parseUnits } from 'viem';
 import {
   arrivalDelay,
+  connectionThreshold,
   datesIn,
   exposureProblem,
   MIN_POPULATION,
@@ -23,9 +24,14 @@ test('the uniform prior gives (k + 1) / (n + 2)', () => {
   assert.equal(probability, 2 / 7);
 });
 
-test('the premium is payout x P x 1.2 with a floor', () => {
+test('the premium is payout x P x 1.2 with a floor, plus the keeper reward', () => {
   assert.equal(priceFromHistory([0, 0, 0, 0, 0], 15, aUSD('1')).premium, aUSD('0.171429'));
-  assert.equal(priceFromHistory(new Array(100).fill(0), 15, aUSD('0.1')).premium, MIN_PREMIUM);
+  const cheap = priceFromHistory(new Array(100).fill(0), 15, aUSD('0.1'));
+  assert.ok(cheap.raw < MIN_PREMIUM);
+  assert.equal(cheap.premium, MIN_PREMIUM);
+  const withReward = priceFromHistory([0, 0, 0, 0, 0], 15, aUSD('1'), UNIFORM_PRIOR, aUSD('0.1'));
+  assert.equal(withReward.risk, aUSD('0.171429'));
+  assert.equal(withReward.premium, aUSD('0.271429'));
 });
 
 test('the population prior needs enough other flights', () => {
@@ -54,7 +60,10 @@ test('arrivalDelay reads a response the way the contract does', () => {
     minutes: 155,
     reason: '155 min late',
   });
-  assert.equal(arrivalDelay(flight('Arrived', { scheduledTime, revisedTime: { utc: '2026-10-29 18:20Z' } })).minutes, 0);
+  assert.equal(
+    arrivalDelay(flight('Arrived', { scheduledTime, revisedTime: { utc: '2026-10-29 18:20Z' } })).minutes,
+    0
+  );
   assert.equal(arrivalDelay(flight('Arrived', { scheduledTime })).reason, 'no actual arrival time');
   assert.equal(arrivalDelay(flight('Canceled', { scheduledTime })).reason, 'status Canceled');
   assert.equal(arrivalDelay('').reason, 'did not operate');
@@ -74,7 +83,26 @@ test('shiftDate crosses months', () => {
 test('exposure caps per flight and per departure date', () => {
   const pool = aUSD('10');
   assert.equal(exposureProblem({ pool, flightReserved: 0n, dateReserved: 0n, payout: aUSD('5') }), undefined);
-  assert.match(exposureProblem({ pool, flightReserved: aUSD('4'), dateReserved: aUSD('4'), payout: aUSD('2') })!, /this flight/);
+  assert.match(
+    exposureProblem({ pool, flightReserved: aUSD('4'), dateReserved: aUSD('4'), payout: aUSD('2') })!,
+    /this flight/
+  );
   assert.match(exposureProblem({ pool, flightReserved: 0n, dateReserved: aUSD('7'), payout: aUSD('2') })!, /that date/);
   assert.equal(exposureProblem({ pool: 0n, flightReserved: 0n, dateReserved: 0n, payout: 1n }), 'the pool is empty');
+});
+
+test('a self-transfer connection becomes a delay threshold on the first flight', () => {
+  // Lands 10:00Z, the next flight leaves 13:00Z, 90 min needed to collect bags and check in again
+  assert.deepEqual(connectionThreshold('2026-10-31 10:00Z', '2026-10-31 13:00Z', 90), {
+    gapMinutes: 180,
+    thresholdMinutes: 90,
+  });
+  // Across midnight
+  assert.equal(connectionThreshold('2026-10-31 22:30Z', '2026-11-01 01:30Z', 60).thresholdMinutes, 120);
+});
+
+test('a connection that is too tight or impossible is not insured', () => {
+  assert.match(connectionThreshold('2026-10-31 10:00Z', '2026-10-31 11:40Z', 90).problem!, /less than 15 min of slack/);
+  assert.match(connectionThreshold('2026-10-31 10:00Z', '2026-10-31 09:00Z', 90).problem!, /leaves before/);
+  assert.match(connectionThreshold('', '2026-10-31 09:00Z', 90).problem!, /no times/);
 });

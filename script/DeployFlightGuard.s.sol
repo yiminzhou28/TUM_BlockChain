@@ -11,18 +11,20 @@ contract DeployFlightGuard is Script {
     address constant AERODATABOX_AIRNODE = 0x83FE2E8F24E66520B1902C3507De4F471248f2Ec;
     address constant AUSD = 0xbeA34973e5f67F18F656A2C6070C64326C791808;
     uint256 constant POOL_FUNDING = 3e6; // 3 aUSD
+    // Paid to whoever settles a policy: covers the 0.05 aUSD signed outcome it buys, so settling never costs the keeper
+    uint256 constant KEEPER_REWARD = 0.1e6; // 0.1 aUSD
 
     function run() external {
         uint256 key = vm.envUint("PAYER_PRIVATE_KEY");
         address underwriter = vm.addr(key);
 
         vm.startBroadcast(key);
-        FlightGuard guard = new FlightGuard(AERODATABOX_AIRNODE, IERC20(AUSD), underwriter);
+        FlightGuard guard = new FlightGuard(AERODATABOX_AIRNODE, IERC20(AUSD), underwriter, KEEPER_REWARD);
         IERC20(AUSD).transfer(address(guard), POOL_FUNDING);
         vm.stopBroadcast();
 
         console.log("FlightGuard deployed at", address(guard));
         console.log("Underwriter", underwriter);
-        console.log("Pool funded with 3 aUSD");
+        console.log("Pool funded with 3 aUSD, keeper reward 0.1 aUSD");
     }
 }

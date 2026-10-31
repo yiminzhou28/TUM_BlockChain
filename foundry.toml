@@ -17,6 +17,15 @@ fs_permissions = [{ access = "read", path = "./test/fixtures" }]
 # Leaves out the compiler warnings of the dependencies.
 ignored_warnings_from = ["lib"]
 
+[lint]
+# Reviewed and kept on purpose:
+# - block-timestamp: FlightGuard compares times in windows of minutes to days (15 min proof of sale, 1 h outcome, 2 h
+#   sales close, 3 day settlement window); the few seconds a validator can shift a timestamp do not matter.
+# - reentrancy-events: the only external calls go to the token fixed at deployment (aUSD), a plain ERC-20 without
+#   hooks, which cannot re-enter.
+# - require-revert-in-loop: the loops check each character of a flight number or date, and must stop at a bad one.
+exclude_lints = ["block-timestamp", "reentrancy-events", "require-revert-in-loop"]
+
 [fuzz]
 runs = 1000
 

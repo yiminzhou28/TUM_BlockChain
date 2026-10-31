@@ -1,0 +1,10 @@
+{
+  "flightNumber": "LH638",
+  "dateLocal": "2026-10-30",
+  "airport": "MUC",
+  "airnode": "0x83FE2E8F24E66520B1902C3507De4F471248f2Ec",
+  "requestHash": "0x0e6921dbd04f3a0c9761c2a348263fd9587c1750a8b587543ef04cfebb7a6af6",
+  "timestamp": "1793436075",
+  "data": "{\"status\":\"Canceled\"}",
+  "signature": "0xec75aa190d646e04cfeaf91e49cc3b9d093cf16dd53aff0aab6a882f4693792036c2aac941d844e7b9be4d74ef493d9db5527eaf657313a8f5a8c87916f44be11b"
+}
