@@ -14,11 +14,11 @@ Built for the API3 AirnodeHub track of the TUM Blockchain & AI Hackathon 2026.
 |                            |                                                                                                                                      |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | Network                    | Base Sepolia (chain id 84532)                                                                                                        |
-| FlightGuard contract       | [`0xbce017f3ebccf26bcf28dcf125501b9aafb3d931`](https://sepolia.basescan.org/address/0xbce017f3ebccf26bcf28dcf125501b9aafb3d931)      |
+| FlightGuard contract       | [`0x154495adb5b699654baa13c862d04dc2eedad523`](https://sepolia.basescan.org/address/0x154495adb5b699654baa13c862d04dc2eedad523)      |
 | Data source                | [AeroDataBox on AirnodeHub](https://airnodehub.api3.org/explore/aerodatabox): `flightStatusOnDate`, `flightDates`, `airportSchedule` |
 | AeroDataBox Airnode signer | `0x83FE2E8F24E66520B1902C3507De4F471248f2Ec`                                                                                         |
 | Payment token              | aUSD `0xbeA34973e5f67F18F656A2C6070C64326C791808`                                                                                    |
-| Try everything locally     | `pnpm e2e`: a day of flights on a local chain, 62 checks, nothing real spent                                                         |
+| Try everything locally     | `pnpm e2e`: a day of flights on a local chain, 65 checks, nothing real spent                                                         |
 
 ## What is new
 
@@ -111,7 +111,7 @@ MCP server below.
  buys the flight's history over
  x402, prices it
  signs a quote ─────────────────► buyPolicy(quote, sig, proof) ──────────────────────────────────────► quote signed by the
-                                                                                                        underwriter, proof of
+                                                                                                        quote signer, proof of
                                                                                                         sale signed by the
                                                                                                         Airnode: Expected, 2+ h
                                                                                                         takes the premium,
@@ -151,7 +151,8 @@ The agent explains every number in its output and refuses to sell when:
 - the premium would reach the payout: no one should pay that;
 - the cover on that flight would exceed 50 % of the pool, or on all flights departing that date 80 %, counting the
   quotes it signed that are still open: one strike or storm hits every policy on a flight, and often every flight on a
-  day;
+  day. The contract enforces the same two caps on what is sold, so they hold even if the agent is wrong;
+- the payout is above the contract's limit, or the underwriter has paused sales;
 - the AeroDataBox Airnode publishes a different signer from the one FlightGuard trusts: every response would be refused
   on-chain after being paid for.
 
@@ -172,8 +173,20 @@ connection with less than 15 minutes of slack is not insured.
 
 ### Other safeguards
 
-- A quote is signed by the underwriter and binds holder, flight, date, premium, payout, threshold, expiry, nonce, chain
+- A quote is signed by the quote signer and binds holder, flight, date, premium, payout, threshold, expiry, nonce, chain
   id and contract address. It can be used once and only by its holder, from the holder's own wallet.
+- **The delay counts from the schedule the traveller bought.** The scheduled arrival in the signed proof of sale is
+  stored with the policy, and `settle` measures the actual arrival against it. An airline that retimes the flight after
+  the sale cannot shrink the delay: a flight moved 30 minutes later that lands 40 minutes after the old schedule is
+  40 minutes late.
+- **Limits in the contract, not only in the agent.** The cover on one flight can be at most 50 % of the pool and on one
+  departure date 80 %; each payout is at most `maxPayout`, fixed at deployment. A leaked or buggy quote signer cannot
+  concentrate the pool on one flight or sell one huge policy.
+- **A quote key the owner can replace.** Quotes are signed by `quoteSigner`, which the underwriter can rotate with
+  `setQuoteSigner`; every quote the old key signed stops working at once, and the pool never moves.
+- **A pause for sales only.** `setPaused` stops new policies, for example when a storm is forecast or a key may have
+  leaked. Policies already sold still settle, pay out and expire as before: the underwriter can stop selling, never
+  stop paying.
 - The payout and the keeper reward are reserved when the policy is bought, so every payout is fully funded: the pool can
   lose money but never fail to pay. The underwriter can never withdraw reserved funds.
 - Each policy settles once, on either path. An unsettled policy can be expired 3 days after its date, which releases its
@@ -189,8 +202,8 @@ connection with less than 15 minutes of slack is not insured.
 - **Not trusted:** whoever submits data, the traveller and the keeper.
 - **Trusted:** the AeroDataBox Airnode key and AeroDataBox's data itself. The signature proves where the data came from,
   not that it is right; that is the trust any flight insurance places in its flight data provider.
-- **The underwriter** prices and sells; the contract enforces what it signed and the proof of sale. It cannot touch
-  reserved payouts.
+- **The underwriter** prices and sells; the contract enforces what it signed, the proof of sale and the limits. It cannot
+  touch reserved payouts, and pausing sales does not stop a single payout.
 
 ## Use it from an AI assistant (MCP)
 
@@ -260,6 +273,10 @@ Everything runs on Base Sepolia with test tokens. Use fresh wallets that never h
 5. Create a second key for the traveller with `cast wallet new`, add `TRAVELLER_PRIVATE_KEY=0x<traveller private key>`
    to `.env`, and run `node --env-file=.env src/agent.ts fund-traveller` to give it 1.5 aUSD and some ETH for gas.
    Without a traveller key, the underwriter buys its own policies.
+6. Optional: a separate key for signing quotes. Create it with `cast wallet new`, add
+   `QUOTE_SIGNER_PRIVATE_KEY=0x<quote signer private key>` to `.env`, and make it the contract's quote signer:
+   `source .env && cast send $FLIGHTGUARD_ADDRESS "setQuoteSigner(address)" <quote signer address> --private-key $PAYER_PRIVATE_KEY --rpc-url https://sepolia.base.org`.
+   Without it, the underwriter key signs quotes.
 
 ## Commands
 
@@ -269,7 +286,7 @@ transaction that settled each payment.
 ### Tests
 
 ```sh
-forge test --match-contract FlightGuard   # contract: 53 tests (2 skip until their fixtures exist, see below)
+forge test --match-contract FlightGuard   # contract: 61 tests (2 skip until their fixtures exist, see below)
 pnpm test                                 # TypeScript: pricing, connections, exposure, Airnode helpers (24 tests)
 pnpm e2e                                  # end to end on a local chain (about 4 minutes, needs Foundry)
 ```
@@ -283,7 +300,8 @@ forge test --match-contract FlightGuard --match-test RevertWhen   # every revert
 
 `test/FlightGuard.t.sol` covers the proof of sale (each unsellable status, exactly 2 hours, too old, edited, another
 flight or date, wrong key, an arrival or status response used as a proof of sale), both settlement paths and their
-tamper cases, the keeper reward on every path, expiry and the pool.
+tamper cases, the keeper reward on every path, expiry, the pool, a flight retimed after the sale, the cover caps, the
+payout limit, the quote signer rotation and the pause.
 
 `test/FlightGuardRealData.t.sol` runs the contract against responses the real AeroDataBox Airnode signed: LH400's
 arrival and status (included), a real cancelled flight (`find-cancelled`) and a real proof of sale bought through
@@ -316,8 +334,8 @@ node --env-file=.env src/find-cancelled.ts            # default MUC FRA, or name
 source .env && forge script script/DeployFlightGuard.s.sol --rpc-url https://sepolia.base.org --broadcast
 ```
 
-Deploys FlightGuard with the key in `PAYER_PRIVATE_KEY` as underwriter, a keeper reward of 0.1 aUSD, and moves 3 aUSD
-into the pool (the underwriter needs 3 aUSD). Then put the new address in `.env`:
+Deploys FlightGuard with the key in `PAYER_PRIVATE_KEY` as underwriter and quote signer, a keeper reward of 0.1 aUSD,
+payouts up to 2 aUSD, and moves 3 aUSD into the pool (the underwriter needs 3 aUSD). Then put the new address in `.env`:
 
 ```sh
 NEW=$(node -e "console.log(require('./broadcast/DeployFlightGuard.s.sol/84532/run-latest.json').transactions.find(t => t.transactionType === 'CREATE').contractAddress)")
@@ -337,9 +355,10 @@ above.
 | `buy`                                                                                                  | traveller   | Approves exactly the premium and buys the policy in `quote.json` with its proof of sale.                                                                                                                                                                                                           |
 | `watch [hours]`                                                                                        | keeper      | Runs on its own: sleeps until each flight's scheduled arrival, settles it on whichever path the signed data allows, checks again after the estimated arrival if it is not down yet, picks up policies bought while it runs, and stops when none is left or after `hours` (default 12).             |
 | `keeper`                                                                                               | keeper      | The same, once, for every active policy.                                                                                                                                                                                                                                                           |
-| `status`                                                                                               | anyone      | The pool, the reserve, the keeper reward, both wallets' aUSD and every policy.                                                                                                                                                                                                                     |
+| `status`                                                                                               | anyone      | The pool, the reserve, the keeper reward, whether sales are open, the payout limit, the quote signer, both wallets' aUSD and every policy with its scheduled arrival.                                                                                                                              |
 | `fund-traveller [aUSD] [ETH]`                                                                          | underwriter | Sends the traveller aUSD for premiums and ETH for gas (defaults 1.5 and 0.00002).                                                                                                                                                                                                                  |
 | `withdraw`                                                                                             | underwriter | Takes back everything in the pool that is not reserved for active policies.                                                                                                                                                                                                                        |
+| `pause` / `resume`                                                                                     | underwriter | Stops or restarts sales. Policies already sold still settle and pay out.                                                                                                                                                                                                                           |
 
 All of them start with `node --env-file=.env src/agent.ts`. On a Mac, run `watch` under `caffeinate -i` so the
 computer does not sleep while it waits.
@@ -362,10 +381,11 @@ node --env-file=.env src/agent.ts status
 
 ## Deployments
 
-| Version | Address                                                                                                                         |                                                                                                                                                                                                   |
-| ------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| v4      | [`0xbce017f3ebccf26bcf28dcf125501b9aafb3d931`](https://sepolia.basescan.org/address/0xbce017f3ebccf26bcf28dcf125501b9aafb3d931) | This code: proof of sale, keeper reward                                                                                                                                                           |
-| v3      | [`0x170ED8eeAD82B1a56d7d00938E94b8200Db801B1`](https://sepolia.basescan.org/address/0x170ED8eeAD82B1a56d7d00938E94b8200Db801B1) | Before the proof of sale. Two real policies on DE1130 and DE1598 departing 31 Oct 2026, bought on 30 Oct and left to the watch keeper overnight; their `PolicySettled` events show how they ended |
+| Version | Address                                                                                                                         |                                                                                                                                                                                                                                                                                                               |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| v5      | [`0x154495adb5b699654baa13c862d04dc2eedad523`](https://sepolia.basescan.org/address/0x154495adb5b699654baa13c862d04dc2eedad523) | This code: delay from the schedule bought, cover caps, payout limit, rotatable quote signer and pause in the contract. Policy #0: LH109 MUC-FRA on 31 Oct 2026, [bought](https://sepolia.basescan.org/tx/0x55d5331771867451dea43d0e049da67cdf629744b5ba5aaee276da60bc646a2b) with a real signed proof of sale |
+| v4      | [`0xbce017f3ebccf26bcf28dcf125501b9aafb3d931`](https://sepolia.basescan.org/address/0xbce017f3ebccf26bcf28dcf125501b9aafb3d931) | Proof of sale, keeper reward. Two real policies bought on 31 Oct 2026: LH109 MUC-FRA, and self-transfer cover for LH108 FRA-MUC connecting to LH434 MUC-ORD, settled by the watch keeper                                                                                                                      |
+| v3      | [`0x170ED8eeAD82B1a56d7d00938E94b8200Db801B1`](https://sepolia.basescan.org/address/0x170ED8eeAD82B1a56d7d00938E94b8200Db801B1) | Before the proof of sale. Two real policies on DE1130 and DE1598 departing 31 Oct 2026, bought on 30 Oct and left to the watch keeper overnight; their `PolicySettled` events show how they ended                                                                                                             |
 
 ## Files
 
@@ -388,17 +408,16 @@ node --env-file=.env src/agent.ts status
 What a real deployment would change, in the order we would do it. None of it changes the core: every input that moves
 money stays a response the provider signed, checked by the contract.
 
-| Today                                                                    | In production                                                                                                  | Why                                                                                                   |
-| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| The delay is measured against the scheduled arrival in the outcome       | Store the scheduled arrival from the proof of sale at purchase and measure against it                          | An airline retiming the flight after the sale is a delay to the traveller who bought the old schedule |
-| One key owns the pool, signs quotes and pays for data                    | A quote-signing key the pool owner can rotate, with limits per quote and per day; the pool owned by a multisig | A leaked agent key could sign underpriced quotes; today it would have the whole pool                  |
-| Holder, flight number and date are public on-chain                       | Policies held by the platform's wallet, or a salted commitment to flight and date revealed at settlement       | Anyone can see who flies where and when                                                               |
-| One data source                                                          | A second, independent flight data Airnode that must agree, or a fallback when one lags                         | Removes the single trusted signer and outages                                                         |
-| The traveller types the operating flight number                          | Resolve codeshare numbers to the operating flight before quoting                                               | Tickets often carry a partner's flight number                                                         |
-| Exposure caps in the agent; a fully reserved pool                        | Caps and a pause in the contract; capital from liquidity providers or a reinsurer                              | Concentration limits that do not depend on the agent, and capital that scales                         |
-| Price from the flight's last departures and the agent's population prior | Add route and airport delay rates, weather and time of day; tiered payouts (30, 60, 120 minutes)               | Sharper prices, and less room for a traveller who knows a storm is coming                             |
-| Testnet aUSD from the traveller's wallet                                 | USDC on Base, paid by the platform or the assistant at checkout; payout to the traveller's wallet or account   | Travellers do not need crypto                                                                         |
-| A licence is out of scope                                                | A licensed insurer or MGA runs the underwriter agent and the pool                                              | Selling insurance needs a licence; FlightGuard is their settlement layer                              |
+| Today                                                                    | In production                                                                                                | Why                                                                       |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
+| One key owns the pool and pays for data; the quote key can be rotated    | The pool owned by a multisig; the quote key in an HSM with a daily sales limit                               | The pool owner's key is the last single point of failure                  |
+| Holder, flight number and date are public on-chain                       | Policies held by the platform's wallet, or a salted commitment to flight and date revealed at settlement     | Anyone can see who flies where and when                                   |
+| One data source                                                          | A second, independent flight data Airnode that must agree, or a fallback when one lags                       | Removes the single trusted signer and outages                             |
+| The traveller types the operating flight number                          | Resolve codeshare numbers to the operating flight before quoting                                             | Tickets often carry a partner's flight number                             |
+| A fully reserved pool from one underwriter                               | Capital from liquidity providers or a reinsurer, with the same caps per flight and per date                  | Capital that scales                                                       |
+| Price from the flight's last departures and the agent's population prior | Add route and airport delay rates, weather and time of day; tiered payouts (30, 60, 120 minutes)             | Sharper prices, and less room for a traveller who knows a storm is coming |
+| Testnet aUSD from the traveller's wallet                                 | USDC on Base, paid by the platform or the assistant at checkout; payout to the traveller's wallet or account | Travellers do not need crypto                                             |
+| A licence is out of scope                                                | A licensed insurer or MGA runs the underwriter agent and the pool                                            | Selling insurance needs a licence; FlightGuard is their settlement layer  |
 
 ### Known limitations
 

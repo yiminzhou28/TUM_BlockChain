@@ -10,8 +10,10 @@
 //   node --env-file=.env src/agent.ts status
 //   node --env-file=.env src/agent.ts fund-traveller [aUSD] [ETH]
 //   node --env-file=.env src/agent.ts withdraw
+//   node --env-file=.env src/agent.ts pause | resume
 //
 // PAYER_PRIVATE_KEY is the underwriter: it owns the pool, pays for data, signs quotes and sends settlements.
+// QUOTE_SIGNER_PRIVATE_KEY, if set, signs quotes instead; the underwriter makes it the contract's quote signer first.
 // TRAVELLER_PRIVATE_KEY, if set, is the traveller who buys policies and receives payouts. Without it the underwriter
 // buys as well. src/mcp.ts offers the same actions to an AI assistant.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -58,7 +60,7 @@ import {
 } from './pricing.ts';
 import { createScriptFetch } from './script-options.ts';
 
-export const FLIGHTGUARD = (process.env.FLIGHTGUARD_ADDRESS ?? '0xbce017f3ebccf26bcf28dcf125501b9aafb3d931') as Address;
+export const FLIGHTGUARD = (process.env.FLIGHTGUARD_ADDRESS ?? '0x154495adb5b699654baa13c862d04dc2eedad523') as Address;
 const AUSD: Address = '0xbeA34973e5f67F18F656A2C6070C64326C791808';
 const RPC = process.env.BASE_SEPOLIA_RPC ?? 'https://sepolia.base.org';
 const EXPLORER = process.env.EXPLORER ?? 'https://sepolia.basescan.org';
@@ -82,7 +84,6 @@ const file = (name: string) => new URL(name, ROOT);
 // Local state, kept out of git
 const QUOTE_FILE = file('quote.json'); // the last signed quote and its proof of sale, for buy
 const HISTORY_FILE = file('flight-history.json'); // every past flight outcome the agent bought, reused for pricing
-const SCHEDULE_FILE = file('schedule.json'); // scheduled arrival of each quoted flight, so watch knows when to look
 const SALE_FILE = file('sale-proofs.json'); // the latest checked schedule and proof of sale of each flight
 const DATES_FILE = file('flight-dates.json'); // the past departures of each flight, looked up once a day
 const QUOTES_FILE = file('quotes-signed.json'); // quotes the underwriter signed that may still be bought
@@ -90,6 +91,11 @@ const QUOTES_FILE = file('quotes-signed.json'); // quotes the underwriter signed
 const { abi } = JSON.parse(readFileSync(file('out/FlightGuard.sol/FlightGuard.json'), 'utf8'));
 if (!process.env.PAYER_PRIVATE_KEY) throw new Error('Set PAYER_PRIVATE_KEY in .env');
 const underwriter = privateKeyToAccount(process.env.PAYER_PRIVATE_KEY as Hex);
+// The key that signs quotes. The underwriter can rotate it on-chain with setQuoteSigner, so a leaked quote key is
+// replaced without moving the pool.
+const quoteSigner = process.env.QUOTE_SIGNER_PRIVATE_KEY
+  ? privateKeyToAccount(process.env.QUOTE_SIGNER_PRIVATE_KEY as Hex)
+  : underwriter;
 const traveller = process.env.TRAVELLER_PRIVATE_KEY
   ? privateKeyToAccount(process.env.TRAVELLER_PRIVATE_KEY as Hex)
   : underwriter;
@@ -171,7 +177,7 @@ async function checkDataSource() {
 
 // ---------------------------------------------------------------- policies on chain
 
-type PolicyTuple = [Address, Hex, bigint, bigint, bigint, number, string, string];
+type PolicyTuple = [Address, Hex, bigint, bigint, bigint, number, string, string, bigint];
 type Policy = Awaited<ReturnType<typeof readPolicies>>[number];
 
 async function readPolicies() {
@@ -188,6 +194,8 @@ async function readPolicies() {
       status: STATUS[p[5]],
       flightNumber: p[6],
       dateLocal: p[7],
+      // The scheduled arrival in the proof of sale: the delay is measured from it, even if the airline retimes the flight
+      scheduledArrival: Number(p[8]),
     });
   }
   return policies;
@@ -355,6 +363,18 @@ export async function quote(
   }
   if (!Number.isInteger(count) || count < 2 || count > 14)
     throw new Error(`History ${countText} must be 2 to 14 flights`);
+  // Before paying for any data: would the contract accept this quote at all?
+  const [paused, maxPayout, signer] = await Promise.all([
+    read('paused') as Promise<boolean>,
+    read('maxPayout') as Promise<bigint>,
+    read('quoteSigner') as Promise<Address>,
+  ]);
+  if (paused) throw new Error('Not selling: the underwriter has paused sales');
+  if (payout > maxPayout)
+    throw new Error(`Not selling: the payout ${aUSD(payout)} is above the ${aUSD(maxPayout)} limit`);
+  if (!isAddressEqual(signer, quoteSigner.address)) {
+    throw new Error(`FlightGuard accepts quotes signed by ${signer}, but this agent signs with ${quoteSigner.address}`);
+  }
   await checkDataSource();
   // Counts the signed responses this quote pays for
   const scriptFetch = createScriptFetch();
@@ -368,7 +388,6 @@ export async function quote(
   // 1-2. Is the flight still sellable? The schedule check and the signed proof of sale, shared by every traveller.
   const { schedule, saleProof } = await checkSellable(flightNumber, dateLocal, payingFetch);
   const { scheduledDeparture, scheduledArrival } = schedule;
-  writeJson(SCHEDULE_FILE, { ...readJson(SCHEDULE_FILE, {}), [`${flightNumber}|${dateLocal}`]: scheduledArrival });
 
   // 1b. Self-transfer cover: the slack in the connection becomes the delay threshold on the first flight.
   let connectionSummary: Record<string, unknown> | undefined;
@@ -518,7 +537,7 @@ export async function quote(
     nonce: BigInt(Date.now()),
   };
   const quoteHash = (await read('hashQuote', [q])) as Hex;
-  const signature = await underwriter.signMessage({ message: { raw: quoteHash } });
+  const signature = await quoteSigner.signMessage({ message: { raw: quoteHash } });
   const signedQuote: SignedQuote = {
     contract: FLIGHTGUARD,
     hash: quoteHash,
@@ -536,7 +555,7 @@ export async function quote(
     connection: connectionSummary,
   });
   log(
-    `Signed by underwriter ${short(underwriter.address)} for traveller ${short(traveller.address)}, valid until ${iso(validUntil)}. Saved to quote.json`
+    `Signed by quote signer ${short(quoteSigner.address)} for traveller ${short(traveller.address)}, valid until ${iso(validUntil)}. Saved to quote.json`
   );
   return {
     flightNumber,
@@ -672,9 +691,15 @@ async function checkPolicy(p: Policy, payingFetch: typeof fetch, reward: bigint)
     await verifySignedResponse(signed, AERODATABOX_ADDRESS, deriveFlightRequestHash(p.flightNumber, p.dateLocal));
     const data = JSON.parse(signed.data);
     if (data.status === 'Arrived') {
-      const delay = Math.max(0, Math.floor((parseUtc(data.actualArrival) - parseUtc(data.scheduledArrival)) / 60_000));
+      // The same delay as the contract computes: from the scheduled arrival the traveller bought
+      const bought = p.scheduledArrival;
+      const delay = Math.max(0, Math.floor((Math.floor(parseUtc(data.actualArrival) / 1000) - bought) / 60));
+      const retimed =
+        data.scheduledArrival && parseUtc(data.scheduledArrival) / 1000 !== bought
+          ? `, now ${data.scheduledArrival}`
+          : '';
       log(
-        `  signed by AeroDataBox: arrived ${data.actualArrival}, scheduled ${data.scheduledArrival} -> ${delay} min late`
+        `  signed by AeroDataBox: arrived ${data.actualArrival}, scheduled ${iso(bought)} when bought${retimed} -> ${delay} min late`
       );
       const tx = await sendSettlement('settle', p.id, signed);
       log(
@@ -773,14 +798,12 @@ export async function watch(hoursText: string | number = '12') {
         checked = true;
       }
       const reward = await keeperReward();
-      // Read again every round, so a policy quoted while the watch runs is first looked at when its flight lands
-      const scheduled = readJson<Record<string, string>>(SCHEDULE_FILE, {});
+      // A policy bought while the watch runs is first looked at when its flight is scheduled to land, read on-chain
       for (const p of active) {
         const id = p.id.toString();
         if (!next.has(id)) {
-          const arrival = scheduled[`${p.flightNumber}|${p.dateLocal}`];
-          next.set(id, arrival ? Math.floor(parseUtc(arrival) / 1000) : nowSeconds());
-          log(`Policy #${id} ${p.flightNumber}: first look ${arrival ? `at its scheduled arrival ${arrival}` : 'now'}`);
+          next.set(id, p.scheduledArrival);
+          log(`Policy #${id} ${p.flightNumber}: first look at its scheduled arrival ${iso(p.scheduledArrival)}`);
         }
         if ((next.get(id) as number) > nowSeconds()) continue;
         try {
@@ -817,20 +840,27 @@ export async function watch(hoursText: string | number = '12') {
 // ---------------------------------------------------------------- pool and wallets
 
 export async function status() {
-  const [pool, reserved, reward, underwriterBalance, travellerBalance, policies] = await Promise.all([
-    balanceOf(FLIGHTGUARD),
-    read('totalReserved') as Promise<bigint>,
-    keeperReward(),
-    balanceOf(underwriter.address),
-    balanceOf(traveller.address),
-    readPolicies(),
-  ]);
+  const [pool, reserved, reward, underwriterBalance, travellerBalance, policies, paused, maxPayout, signer] =
+    await Promise.all([
+      balanceOf(FLIGHTGUARD),
+      read('totalReserved') as Promise<bigint>,
+      keeperReward(),
+      balanceOf(underwriter.address),
+      balanceOf(traveller.address),
+      readPolicies(),
+      read('paused') as Promise<boolean>,
+      read('maxPayout') as Promise<bigint>,
+      read('quoteSigner') as Promise<Address>,
+    ]);
   log(`FlightGuard ${FLIGHTGUARD}: pool ${aUSD(pool)}, reserved ${aUSD(reserved)}, keeper reward ${aUSD(reward)}`);
+  log(
+    `Sales ${paused ? 'PAUSED' : 'open'}, payouts up to ${aUSD(maxPayout)}, quotes signed by ${short(signer)}, at most 50% of the pool per flight and 80% per date`
+  );
   log(`Underwriter ${short(underwriter.address)}: ${aUSD(underwriterBalance)}`);
   if (traveller !== underwriter) log(`Traveller ${short(traveller.address)}: ${aUSD(travellerBalance)}`);
   for (const p of policies) {
     log(
-      `  #${p.id} ${p.flightNumber} ${p.dateLocal} holder ${short(p.holder)} payout ${aUSD(p.payout)} threshold ${p.threshold} min: ${p.status}`
+      `  #${p.id} ${p.flightNumber} ${p.dateLocal} arrives ${iso(p.scheduledArrival)} holder ${short(p.holder)} payout ${aUSD(p.payout)} threshold ${p.threshold} min: ${p.status}`
     );
   }
   return {
@@ -838,6 +868,9 @@ export async function status() {
     pool: aUSD(pool),
     reserved: aUSD(reserved),
     keeperReward: aUSD(reward),
+    salesPaused: paused,
+    maxPayout: aUSD(maxPayout),
+    quoteSigner: signer,
     traveller: aUSD(travellerBalance),
     policies: policies.map((p) => ({
       id: Number(p.id),
@@ -845,6 +878,7 @@ export async function status() {
       date: p.dateLocal,
       payout: aUSD(p.payout),
       thresholdMinutes: Number(p.threshold),
+      scheduledArrival: iso(p.scheduledArrival),
       status: p.status,
     })),
   };
@@ -879,6 +913,21 @@ export async function withdraw() {
   log(`Withdrew ${aUSD(available)} from ${FLIGHTGUARD}: ${EXPLORER}/tx/${hash}`);
 }
 
+/** The underwriter stops or restarts sales. Policies already sold still settle and pay out while sales are paused. */
+export async function setPaused(paused: boolean) {
+  const hash = await underwriterWallet.writeContract({
+    address: FLIGHTGUARD,
+    abi,
+    functionName: 'setPaused',
+    args: [paused],
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== 'success') throw new Error(`setPaused reverted: ${EXPLORER}/tx/${hash}`);
+  log(
+    `${paused ? 'Sales paused: no new policies until resume. Sold policies still settle' : 'Sales open again'}: ${EXPLORER}/tx/${hash}`
+  );
+}
+
 // ---------------------------------------------------------------- main
 
 if (import.meta.main) {
@@ -892,11 +941,13 @@ if (import.meta.main) {
     else if (command === 'status') await status();
     else if (command === 'fund-traveller') await fundTraveller(args[0], args[1]);
     else if (command === 'withdraw') await withdraw();
+    else if (command === 'pause') await setPaused(true);
+    else if (command === 'resume') await setPaused(false);
     else {
       console.log(
         'Usage: src/agent.ts quote <flight> <YYYY-MM-DD> [payout] [threshold min] [history flights] | ' +
           'quote-connection <first flight> <date> <second flight> <date> [payout] [minutes to change] [history] | ' +
-          'buy | keeper | watch [hours] | status | fund-traveller [aUSD] [ETH] | withdraw'
+          'buy | keeper | watch [hours] | status | fund-traveller [aUSD] [ETH] | withdraw | pause | resume'
       );
     }
   } catch (error) {

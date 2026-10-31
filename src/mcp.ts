@@ -129,7 +129,8 @@ server.registerTool(
   'policy_status',
   {
     title: 'Show the pool and the policies',
-    description: 'Shows the pool, what it has reserved, the keeper reward, the traveller balance and every policy.',
+    description:
+      'Shows the pool, what it has reserved, the keeper reward, whether sales are open, the payout limit, the quote signer, the traveller balance and every policy.',
     inputSchema: {},
     annotations: { readOnlyHint: true },
   },

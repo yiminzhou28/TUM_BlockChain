@@ -16,6 +16,9 @@ import {ProjectedJson} from "./ProjectedJson.sol";
 /// out if the flight arrived at least `delayThresholdMinutes` late, was cancelled or was diverted. Whoever settles is paid
 /// a keeper reward, so payouts do not depend on the underwriter's goodwill. Nobody who submits data has to be trusted:
 /// the contract checks that the AeroDataBox Airnode signed it, for exactly this flight on exactly this date.
+/// The delay is measured against the scheduled arrival in the proof of sale, the schedule the traveller bought. The
+/// contract caps the cover on one flight and on one date, and caps each payout. The pool owner can rotate the key that
+/// signs quotes and pause sales, but nobody can stop or redirect a payout.
 contract FlightGuard {
     using SafeERC20 for IERC20;
 
@@ -25,8 +28,24 @@ contract FlightGuard {
     /// @notice Token that premiums, payouts and keeper rewards are paid in, such as aUSD
     IERC20 public immutable token;
 
-    /// @notice Address that owns the pool and whose agent signs quotes
+    /// @notice Address that owns the pool: it can withdraw what is not reserved, rotate the quote signer and pause sales.
+    /// It can be a multisig.
     address public immutable underwriter;
+
+    /// @notice Key whose signature makes a quote valid, held by the underwriter's agent. Rotating it invalidates every
+    /// quote it signed that was not bought yet.
+    address public quoteSigner;
+
+    /// @notice While true, no policy can be bought. Settlement and expiry go on.
+    bool public paused;
+
+    /// @notice Largest payout of one policy, so a leaked quote-signing key cannot sell the whole pool at once
+    uint256 public immutable maxPayout;
+
+    /// @notice Most of the pool that the payouts of active policies on one flight, and on one departure date, may take,
+    /// in basis points. One strike or storm hits every policy on a flight, and often every flight on a day.
+    uint256 public constant MAX_FLIGHT_SHARE_BPS = 5_000;
+    uint256 public constant MAX_DATE_SHARE_BPS = 8_000;
 
     /// @notice Paid from the pool to whoever settles a policy, which covers buying the signed outcome. It is reserved
     /// together with the payout when the policy is bought.
@@ -94,11 +113,15 @@ contract FlightGuard {
         Status status;
         string flightNumber;
         string dateLocal;
+        uint256 scheduledArrival; // from the proof of sale: the schedule the traveller bought
     }
 
     Policy[] public policies;
     uint256 public totalReserved;
     mapping(bytes32 => bool) public usedQuotes;
+    /// @notice Payouts of active policies per flight and date (keyed by flightKey) and per date (keyed by dateKey)
+    mapping(bytes32 => uint256) public flightCover;
+    mapping(bytes32 => uint256) public dateCover;
 
     event PolicyBought(
         uint256 indexed policyId,
@@ -112,6 +135,8 @@ contract FlightGuard {
     event PolicyPaidForNoArrival(uint256 indexed policyId, string flightStatus, uint256 paid);
     event KeeperRewarded(uint256 indexed policyId, address indexed keeper, uint256 reward);
     event PolicyExpired(uint256 indexed policyId);
+    event QuoteSignerChanged(address indexed quoteSigner);
+    event SalesPaused(bool paused);
 
     error InvalidQuoteSignature();
     error QuoteExpired();
@@ -130,14 +155,20 @@ contract FlightGuard {
     error SettlementWindowOpen(uint256 settleBy);
     error NotUnderwriter();
     error ZeroAddress();
+    error SalesArePaused();
+    error PayoutTooLarge(uint256 payout, uint256 maxPayout);
+    error FlightCoverTooHigh(uint256 cover, uint256 limit);
+    error DateCoverTooHigh(uint256 cover, uint256 limit);
 
-    constructor(address airnode_, IERC20 token_, address underwriter_, uint256 keeperReward_) {
+    constructor(address airnode_, IERC20 token_, address underwriter_, uint256 keeperReward_, uint256 maxPayout_) {
         if (airnode_ == address(0) || address(token_) == address(0) || underwriter_ == address(0)) {
             revert ZeroAddress();
         }
         airnode = airnode_;
         token = token_;
         underwriter = underwriter_;
+        quoteSigner = underwriter_;
+        maxPayout = maxPayout_;
         keeperReward = keeperReward_;
     }
 
@@ -152,23 +183,27 @@ contract FlightGuard {
         external
         returns (uint256 policyId)
     {
+        if (paused) revert SalesArePaused();
         if (msg.sender != quote.holder) revert NotQuoteHolder();
         if (block.timestamp > quote.validUntil) revert QuoteExpired();
+        if (quote.payout > maxPayout) revert PayoutTooLarge(quote.payout, maxPayout);
         bytes32 quoteHash = hashQuote(quote);
         if (usedQuotes[quoteHash]) revert QuoteAlreadyUsed();
-        if (ECDSA.recover(MessageHashUtils.toEthSignedMessageHash(quoteHash), underwriterSignature) != underwriter) {
+        if (ECDSA.recover(MessageHashUtils.toEthSignedMessageHash(quoteHash), underwriterSignature) != quoteSigner) {
             revert InvalidQuoteSignature();
         }
-        _checkSellable(quote.flightNumber, quote.dateLocal, saleProof);
+        uint256 scheduledArrival = _checkSellable(quote.flightNumber, quote.dateLocal, saleProof);
         usedQuotes[quoteHash] = true;
-        policyId = _issuePolicy(quote);
+        policyId = _issuePolicy(quote, scheduledArrival);
     }
 
     /// @dev The same three checks as settlement, on the sale request: the AeroDataBox Airnode signed it, for this flight
-    /// on this date, recently. Then the flight must still be expected and far enough from departure.
+    /// on this date, recently. Then the flight must still be expected and far enough from departure. Returns the signed
+    /// scheduled arrival, which the policy keeps.
     function _checkSellable(string calldata flightNumber, string calldata dateLocal, AirnodeResponse calldata proof)
         internal
         view
+        returns (uint256 scheduledArrival)
     {
         AirnodeV2Attestation.verify(
             airnode, deriveSaleRequestHash(flightNumber, dateLocal), proof.timestamp, proof.data, proof.signature
@@ -183,15 +218,18 @@ contract FlightGuard {
         if (block.timestamp + SALES_CLOSE_BEFORE_DEPARTURE > scheduledDeparture) {
             revert TooCloseToDeparture(scheduledDeparture);
         }
+        scheduledArrival = ProjectedJson.readTimestamp(proof.data, "scheduledArrival");
     }
 
-    /// @dev Takes the premium, reserves the payout and the keeper reward, and records the policy
-    function _issuePolicy(Quote calldata quote) internal returns (uint256 policyId) {
+    /// @dev Takes the premium, reserves the payout and the keeper reward, checks the cover caps and records the policy
+    function _issuePolicy(Quote calldata quote, uint256 scheduledArrival) internal returns (uint256 policyId) {
         // The premium joins the pool before the reserve is taken from it.
         token.safeTransferFrom(msg.sender, address(this), quote.premium);
         uint256 reserve = quote.payout + keeperReward;
         uint256 available = availableLiquidity();
         if (available < reserve) revert InsufficientPool(available, reserve);
+
+        _addCover(quote.flightNumber, quote.dateLocal, quote.payout);
         totalReserved += reserve;
 
         policyId = policies.length;
@@ -204,13 +242,31 @@ contract FlightGuard {
                 settleBy: IsoTimestamp.parse(quote.dateLocal) + SETTLEMENT_WINDOW,
                 status: Status.Active,
                 flightNumber: quote.flightNumber,
-                dateLocal: quote.dateLocal
+                dateLocal: quote.dateLocal,
+                scheduledArrival: scheduledArrival
             })
         );
         emit PolicyBought(policyId, quote.holder, quote.flightNumber, quote.dateLocal, quote.premium, quote.payout);
     }
 
-    /// @notice What the underwriter signs, with EIP-191. Binds the quote to this contract and this chain.
+    /// @dev Adds a payout to the cover of its flight and its date, within the caps
+    function _addCover(string calldata flightNumber, string calldata dateLocal, uint256 payout) private {
+        uint256 pool = token.balanceOf(address(this));
+        bytes32 onFlight = flightKey(flightNumber, dateLocal);
+        bytes32 onDate = dateKey(dateLocal);
+        uint256 flightTotal = flightCover[onFlight] + payout;
+        uint256 dateTotal = dateCover[onDate] + payout;
+        if (flightTotal * 10_000 > pool * MAX_FLIGHT_SHARE_BPS) {
+            revert FlightCoverTooHigh(flightTotal, pool * MAX_FLIGHT_SHARE_BPS / 10_000);
+        }
+        if (dateTotal * 10_000 > pool * MAX_DATE_SHARE_BPS) {
+            revert DateCoverTooHigh(dateTotal, pool * MAX_DATE_SHARE_BPS / 10_000);
+        }
+        flightCover[onFlight] = flightTotal;
+        dateCover[onDate] = dateTotal;
+    }
+
+    /// @notice What the quote signer signs, with EIP-191. Binds the quote to this contract and this chain.
     function hashQuote(Quote calldata q) public view returns (bytes32) {
         return keccak256(
             abi.encode(
@@ -245,14 +301,15 @@ contract FlightGuard {
         // 2. Time: the signature covers the timestamp, so it can be trusted from here on.
         if (timestamp + MAX_RESPONSE_AGE < block.timestamp) revert ResponseTooOld(timestamp);
 
-        // 3. The data. The request hash fixes the projection, so these three fields are there.
+        // 3. The data. The request hash fixes the projection, so these fields are there. The delay counts from the
+        //    scheduled arrival the traveller bought, so a flight the airline retimed later after the sale is late.
         string memory flightStatus = ProjectedJson.readString(data, "status");
         if (keccak256(bytes(flightStatus)) != keccak256("Arrived")) revert FlightNotArrived(flightStatus);
-        uint256 scheduledArrival = ProjectedJson.readTimestamp(data, "scheduledArrival");
         uint256 actualArrival = ProjectedJson.readTimestamp(data, "actualArrival");
-        uint256 delayMinutes = actualArrival > scheduledArrival ? (actualArrival - scheduledArrival) / 60 : 0;
+        uint256 boughtArrival = policy.scheduledArrival;
+        uint256 delayMinutes = actualArrival > boughtArrival ? (actualArrival - boughtArrival) / 60 : 0;
 
-        totalReserved -= policy.payout + keeperReward;
+        _release(policy);
         if (delayMinutes >= policy.delayThresholdMinutes) {
             policy.status = Status.PaidOut;
             token.safeTransfer(policy.holder, policy.payout);
@@ -291,11 +348,18 @@ contract FlightGuard {
             revert FlightNotCancelledOrDiverted(flightStatus);
         }
 
-        totalReserved -= policy.payout + keeperReward;
+        _release(policy);
         policy.status = Status.PaidOut;
         token.safeTransfer(policy.holder, policy.payout);
         emit PolicyPaidForNoArrival(policyId, flightStatus, policy.payout);
         _rewardKeeper(policyId);
+    }
+
+    /// @dev Frees the reserve and the cover of a policy that is no longer active
+    function _release(Policy storage policy) private {
+        totalReserved -= policy.payout + keeperReward;
+        flightCover[flightKey(policy.flightNumber, policy.dateLocal)] -= policy.payout;
+        dateCover[dateKey(policy.dateLocal)] -= policy.payout;
     }
 
     /// @dev Whoever brings the signed outcome is paid for it, so a payout never waits for the underwriter to act
@@ -312,7 +376,7 @@ contract FlightGuard {
         if (policy.status != Status.Active) revert PolicyNotActive(policyId);
         if (block.timestamp <= policy.settleBy) revert SettlementWindowOpen(policy.settleBy);
         policy.status = Status.Expired;
-        totalReserved -= policy.payout + keeperReward;
+        _release(policy);
         emit PolicyExpired(policyId);
     }
 
@@ -320,6 +384,32 @@ contract FlightGuard {
 
     function availableLiquidity() public view returns (uint256) {
         return token.balanceOf(address(this)) - totalReserved;
+    }
+
+    /// @notice Key of `flightCover` for one flight number departing on one local date
+    function flightKey(string memory flightNumber, string memory dateLocal) public pure returns (bytes32) {
+        return keccak256(abi.encode(flightNumber, dateLocal));
+    }
+
+    /// @notice Key of `dateCover` for one local departure date
+    function dateKey(string memory dateLocal) public pure returns (bytes32) {
+        return keccak256(abi.encode(dateLocal));
+    }
+
+    /// @notice The underwriter replaces the key that signs quotes, such as after its agent's machine was compromised.
+    /// Every quote the old key signed stops being valid.
+    function setQuoteSigner(address quoteSigner_) external {
+        if (msg.sender != underwriter) revert NotUnderwriter();
+        if (quoteSigner_ == address(0)) revert ZeroAddress();
+        quoteSigner = quoteSigner_;
+        emit QuoteSignerChanged(quoteSigner_);
+    }
+
+    /// @notice The underwriter stops or resumes sales. Policies already sold settle and expire as before.
+    function setPaused(bool paused_) external {
+        if (msg.sender != underwriter) revert NotUnderwriter();
+        paused = paused_;
+        emit SalesPaused(paused_);
     }
 
     /// @notice The underwriter takes out what is not reserved for active policies

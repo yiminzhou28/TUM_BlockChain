@@ -186,10 +186,6 @@ try {
     'the pool holds 3 aUSD and the keeper reward is 0.1 aUSD',
     (await balance(GUARD)) === aUSD('3') && (await readGuard('keeperReward')) === aUSD('0.1')
   );
-  // More capital, so that a day of test policies fits within the exposure caps
-  await send(
-    wallet.writeContract({ address: AUSD, abi: erc20Abi, functionName: 'transfer', args: [GUARD, aUSD('10')] })
-  );
 
   // ---------------------------------------------------------------- the world the stand-in Airnode answers from
 
@@ -289,7 +285,7 @@ try {
   r = agent('quote', 'FG150', fg150, '1', '15');
   check(
     'quotes a flight in CheckIn, verifying every response when the signer document is down',
-    r.ok && r.out.includes('Could not read the signer') && r.out.includes('Signed by underwriter'),
+    r.ok && r.out.includes('Could not read the signer') && r.out.includes('Signed by quote signer'),
     r.out
   );
   check(
@@ -324,8 +320,16 @@ try {
   check('a malformed flight number', !r.ok && r.out.includes('is not like LH400'), r.out);
   r = agent('quote', 'FG100', '31.10.2026', '1', '15');
   check('a malformed date', !r.ok && r.out.includes('is not YYYY-MM-DD'), r.out);
-  r = agent('quote', 'FG100', fg100, '8', '15');
-  check('too much cover on one flight for the pool', !r.ok && r.out.includes('would exceed 50 % of the pool'), r.out);
+  r = agent('quote', 'FG100', fg100, '2', '15');
+  check(
+    'too much cover on one flight for the pool: 2 of 3 aUSD',
+    !r.ok && r.out.includes('would exceed 50 % of the pool'),
+    r.out
+  );
+  // More capital, so that a day of test policies fits within the exposure caps
+  await send(
+    wallet.writeContract({ address: AUSD, abi: erc20Abi, functionName: 'transfer', args: [GUARD, aUSD('10')] })
+  );
 
   // ---------------------------------------------------------------- 3. buying
 
@@ -334,7 +338,7 @@ try {
   r = agent('quote', 'FG100', fg100, '1', '15');
   check(
     'quotes FG100 from its history',
-    r.ok && /Premium: .* keeper reward/.test(r.out) && r.out.includes('Signed by underwriter'),
+    r.ok && /Premium: .* keeper reward/.test(r.out) && r.out.includes('Signed by quote signer'),
     r.out
   );
   r = agent('buy');
@@ -380,12 +384,20 @@ try {
   await setClock(11 * 60);
   r = agent('buy');
   check('refuses a quote after its 10 minutes', !r.ok && r.out.includes('The quote expired'), r.out);
-  r = agent('quote', 'FG100', fg100, '5', '15');
-  check('quotes 5 aUSD more cover on FG100: 1 + 5 aUSD stays within half the pool', r.ok, r.out);
-  r = agent('quote', 'FG100', fg100, '2', '15');
+  // Quotes of 2 aUSD on FG100 until the open ones fill half the pool: each one that is signed counts against the cap
+  const halfPool = (await balance(GUARD)) / 2n;
+  let signed = 0n;
+  for (;;) {
+    r = agent('quote', 'FG100', fg100, '2', '15');
+    if (!r.ok) break;
+    signed += 1n;
+  }
   check(
-    'counts that open quote against the cap: 1 + 5 + 2 aUSD on FG100 is refused',
-    !r.ok && r.out.includes('would exceed 50 % of the pool, counting 1 open quote(s)'),
+    `signs ${signed} more quotes of 2 aUSD on FG100, then refuses the one that would take it past half the pool`,
+    signed > 0n &&
+      aUSD('1') + signed * aUSD('2') <= halfPool &&
+      aUSD('1') + (signed + 1n) * aUSD('2') > halfPool &&
+      r.out.includes(`would exceed 50 % of the pool, counting ${signed} open quote(s)`),
     r.out
   );
 
@@ -486,9 +498,12 @@ try {
   // ---------------------------------------------------------------- 6. the flights land
 
   step(
-    '6. Hours later: FG100 landed 40 min late, FG600 was cancelled, FG700 landed 100 min late, FG1000 is in the air'
+    '6. Hours later: FG100 was retimed 30 min later and landed 40 min after the schedule the traveller bought, ' +
+      'FG600 was cancelled, FG700 landed 100 min late, FG1000 is in the air'
   );
-  update('FG100', fg100, { status: 'Arrived', arrRevised: later(flight('FG100', fg100).arr, 40) });
+  // The airline moved FG100's schedule after the sale: 10 min late against the new one, 40 against the one bought
+  const fg100Bought = flight('FG100', fg100).arr;
+  update('FG100', fg100, { status: 'Arrived', arr: later(fg100Bought, 30), arrRevised: later(fg100Bought, 40) });
   update('FG600', fg600, { status: 'Canceled' });
   update('FG700', fg700, { status: 'Arrived', arrRevised: later(flight('FG700', fg700).arr, 100) });
   update('FG1000', fg1000, { status: 'EnRoute', arrRevised: later(flight('FG1000', fg1000).arr, 20) });
@@ -498,6 +513,11 @@ try {
   check(
     'the keeper pays out the late, the cancelled and the missed connection',
     r.ok && (r.out.match(/PAID OUT 1 aUSD/g) ?? []).length === 3 && r.out.includes('cancelled flight'),
+    r.out
+  );
+  check(
+    'the retimed FG100 counts 40 min late, from the schedule the traveller bought',
+    r.out.includes(`when bought, now ${later(fg100Bought, 30)} -> 40 min late`),
     r.out
   );
   check(
@@ -629,6 +649,27 @@ try {
     'status shows every policy',
     r.ok && ['PaidOut', 'ClosedOnTime', 'Expired'].every((s) => r.out.includes(s)),
     r.out
+  );
+  r = agent('pause');
+  const pausedStatus = agent('status');
+  const fg970 = addFlight('FG970', { departsIn: 2.5 * 3600 });
+  const pausedQuote = agent('quote', 'FG970', fg970, '1', '15');
+  check(
+    'pause stops sales: status shows it and the agent refuses to quote',
+    r.ok &&
+      (await readGuard('paused')) === true &&
+      pausedStatus.out.includes('Sales PAUSED') &&
+      !pausedQuote.ok &&
+      pausedQuote.out.includes('paused sales'),
+    r.out + pausedStatus.out + pausedQuote.out
+  );
+  r = agent('resume');
+  check('resume opens sales again', r.ok && (await readGuard('paused')) === false, r.out);
+  const bigQuote = agent('quote', 'FG970', fg970, '3', '15');
+  check(
+    'a payout above the 2 aUSD limit is refused before any data is bought',
+    !bigQuote.ok && bigQuote.out.includes('above the 2 aUSD limit') && !bigQuote.out.includes('Pricing'),
+    bigQuote.out
   );
 
   // ---------------------------------------------------------------- 10. fixtures for the real-data tests

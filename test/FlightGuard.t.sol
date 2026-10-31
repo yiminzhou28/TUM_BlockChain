@@ -24,6 +24,7 @@ contract FlightGuardTest is AirnodeV2Test {
     uint256 constant AIRNODE_KEY = 0xA11CE;
     uint256 constant UNDERWRITER_KEY = 0xB0B;
     uint256 constant KEEPER_REWARD = 0.1e6;
+    uint256 constant MAX_PAYOUT = 500e6;
     address airnode;
     address underwriter;
     address traveller = makeAddr("traveller");
@@ -55,7 +56,7 @@ contract FlightGuardTest is AirnodeV2Test {
         airnode = vm.addr(AIRNODE_KEY);
         underwriter = vm.addr(UNDERWRITER_KEY);
         usd = new TestUSD();
-        guard = new FlightGuard(airnode, IERC20(address(usd)), underwriter, KEEPER_REWARD);
+        guard = new FlightGuard(airnode, IERC20(address(usd)), underwriter, KEEPER_REWARD, MAX_PAYOUT);
 
         usd.mint(address(guard), 1_000e6); // the underwriter's pool
         usd.mint(traveller, 100e6);
@@ -135,7 +136,7 @@ contract FlightGuardTest is AirnodeV2Test {
     }
 
     function statusOf(uint256 id) internal view returns (FlightGuard.Status status) {
-        (,,,,, status,,) = guard.policies(id);
+        (,,,,, status,,,) = guard.policies(id);
     }
 
     // ------------------------------------------------------------ request hashes
@@ -226,12 +227,15 @@ contract FlightGuardTest is AirnodeV2Test {
     }
 
     function test_RevertWhen_PoolCannotCoverPayoutAndKeeperReward() public {
+        // Empty the pool down to 100 aUSD, so a 100 aUSD payout is exactly the pool after the 5 aUSD premium minus 5
+        vm.prank(underwriter);
+        guard.withdraw(900e6);
         FlightGuard.Quote memory q = quoteFor("LH400", "2026-10-29", 1);
-        q.payout = 1_005e6; // exactly the pool after the premium, but the keeper reward is reserved too
+        q.payout = 105e6; // exactly the pool after the premium, but the keeper reward is reserved too
         bytes memory sig = signQuote(q, UNDERWRITER_KEY);
         FlightGuard.AirnodeResponse memory sale = saleProof("Expected");
         vm.prank(traveller);
-        vm.expectRevert(abi.encodeWithSelector(FlightGuard.InsufficientPool.selector, 1_005e6, 1_005e6 + KEEPER_REWARD));
+        vm.expectRevert(abi.encodeWithSelector(FlightGuard.InsufficientPool.selector, 105e6, 105e6 + KEEPER_REWARD));
         guard.buyPolicy(q, sig, sale);
     }
 
@@ -591,7 +595,7 @@ contract FlightGuardTest is AirnodeV2Test {
 
     function test_ExpireReleasesTheWholeReserveAfterTheWindowAndPaysNoReward() public {
         uint256 id = buyLH400();
-        (,,,, uint256 settleBy,,,) = guard.policies(id);
+        (,,,, uint256 settleBy,,,,) = guard.policies(id);
         vm.expectRevert(abi.encodeWithSelector(FlightGuard.SettlementWindowOpen.selector, settleBy));
         guard.expire(id);
         vm.warp(settleBy + 1);
@@ -604,7 +608,7 @@ contract FlightGuardTest is AirnodeV2Test {
 
     function test_CanStillSettleAfterTheWindowUntilSomeoneExpires() public {
         uint256 id = buyLH400();
-        (,,,, uint256 settleBy,,,) = guard.policies(id);
+        (,,,, uint256 settleBy,,,,) = guard.policies(id);
         uint256 late = settleBy + 1 days;
         vm.warp(late);
         bytes memory sig = signResponse(AIRNODE_KEY, LH400_20261029_HASH, late, DELAYED_DATA);
@@ -616,10 +620,117 @@ contract FlightGuardTest is AirnodeV2Test {
     function test_RevertWhen_DeployedWithAZeroAddress() public {
         IERC20 token = IERC20(address(usd));
         vm.expectRevert(FlightGuard.ZeroAddress.selector);
-        new FlightGuard(address(0), token, underwriter, KEEPER_REWARD);
+        new FlightGuard(address(0), token, underwriter, KEEPER_REWARD, MAX_PAYOUT);
         vm.expectRevert(FlightGuard.ZeroAddress.selector);
-        new FlightGuard(airnode, IERC20(address(0)), underwriter, KEEPER_REWARD);
+        new FlightGuard(airnode, IERC20(address(0)), underwriter, KEEPER_REWARD, MAX_PAYOUT);
         vm.expectRevert(FlightGuard.ZeroAddress.selector);
-        new FlightGuard(airnode, token, address(0), KEEPER_REWARD);
+        new FlightGuard(airnode, token, address(0), KEEPER_REWARD, MAX_PAYOUT);
+    }
+
+    // ------------------------------------------------------------ v5: the schedule bought, keys, caps, pause
+
+    function test_RetimedFlightIsLateAgainstTheScheduleTheTravellerBought() public {
+        uint256 id = buyLH400(); // bought with a scheduled arrival of 18:35Z, 120 minute threshold
+        // The airline later moved the arrival to 20:35Z; the flight lands 20:40Z, "5 minutes late" by the new schedule
+        bytes memory retimed =
+            bytes('{"actualArrival":"2026-10-29 20:40Z","scheduledArrival":"2026-10-29 20:35Z","status":"Arrived"}');
+        bytes memory sig = signResponse(AIRNODE_KEY, LH400_20261029_HASH, SIGNED_AT, retimed);
+        vm.warp(SIGNED_AT + 60);
+        vm.prank(keeper);
+        guard.settle(id, SIGNED_AT, retimed, sig);
+        assertEq(uint256(statusOf(id)), uint256(FlightGuard.Status.PaidOut)); // 125 minutes after 18:35Z
+    }
+
+    function test_RevertWhen_PayoutAboveTheMaximum() public {
+        FlightGuard.Quote memory q = quoteFor("LH400", "2026-10-29", 1);
+        q.payout = MAX_PAYOUT + 1;
+        bytes memory sig = signQuote(q, UNDERWRITER_KEY);
+        FlightGuard.AirnodeResponse memory sale = saleProof("Expected");
+        vm.prank(traveller);
+        vm.expectRevert(abi.encodeWithSelector(FlightGuard.PayoutTooLarge.selector, MAX_PAYOUT + 1, MAX_PAYOUT));
+        guard.buyPolicy(q, sig, sale);
+    }
+
+    function test_RotatingTheQuoteSignerInvalidatesItsQuotes() public {
+        uint256 newKey = 0xC0FFEE;
+        FlightGuard.Quote memory q = quoteFor("LH400", "2026-10-29", 1);
+        bytes memory oldSig = signQuote(q, UNDERWRITER_KEY);
+        vm.prank(underwriter);
+        guard.setQuoteSigner(vm.addr(newKey));
+        FlightGuard.AirnodeResponse memory sale = saleProof("Expected");
+        vm.prank(traveller);
+        vm.expectRevert(FlightGuard.InvalidQuoteSignature.selector);
+        guard.buyPolicy(q, oldSig, sale);
+        bytes memory newSig = signQuote(q, newKey);
+        vm.prank(traveller);
+        guard.buyPolicy(q, newSig, sale);
+        assertEq(guard.policyCount(), 1);
+    }
+
+    function test_RevertWhen_SomeoneElseRotatesTheSignerOrPauses() public {
+        vm.startPrank(keeper);
+        vm.expectRevert(FlightGuard.NotUnderwriter.selector);
+        guard.setQuoteSigner(keeper);
+        vm.expectRevert(FlightGuard.NotUnderwriter.selector);
+        guard.setPaused(true);
+        vm.stopPrank();
+    }
+
+    function test_PauseStopsSalesButNotPayouts() public {
+        uint256 id = buyLH400();
+        vm.prank(underwriter);
+        guard.setPaused(true);
+        FlightGuard.Quote memory q = quoteFor("LH400", "2026-10-29", 2);
+        bytes memory sig = signQuote(q, UNDERWRITER_KEY);
+        FlightGuard.AirnodeResponse memory sale = saleProof("Expected");
+        vm.prank(traveller);
+        vm.expectRevert(FlightGuard.SalesArePaused.selector);
+        guard.buyPolicy(q, sig, sale);
+
+        bytes memory outcome = signResponse(AIRNODE_KEY, LH400_20261029_HASH, SIGNED_AT, DELAYED_DATA);
+        vm.warp(SIGNED_AT + 60);
+        vm.prank(keeper);
+        guard.settle(id, SIGNED_AT, DELAYED_DATA, outcome);
+        assertEq(uint256(statusOf(id)), uint256(FlightGuard.Status.PaidOut));
+    }
+
+    function test_RevertWhen_CoverOnOneFlightExceedsHalfThePool() public {
+        FlightGuard.Quote memory q = quoteFor("LH400", "2026-10-29", 1);
+        q.payout = 500e6; // the pool is 1005 aUSD after the premium: half is 502.5, so this fits
+        buyWith(q, saleProof("Expected"));
+        FlightGuard.Quote memory more = quoteFor("LH400", "2026-10-29", 2);
+        more.payout = 10e6; // 510 on the flight, against half of 1010
+        bytes memory sig = signQuote(more, UNDERWRITER_KEY);
+        FlightGuard.AirnodeResponse memory sale = saleProof("Expected");
+        vm.prank(traveller);
+        vm.expectRevert(abi.encodeWithSelector(FlightGuard.FlightCoverTooHigh.selector, 510e6, 505e6));
+        guard.buyPolicy(more, sig, sale);
+    }
+
+    function test_RevertWhen_CoverOnOneDateExceedsEightyPercentOfThePool() public {
+        FlightGuard.Quote memory q = quoteFor("LH400", "2026-10-29", 1);
+        q.payout = 450e6;
+        buyWith(q, saleProof("Expected"));
+        // Another flight the same day
+        bytes32 otherSale = guard.deriveSaleRequestHash("LH402", "2026-10-29");
+        FlightGuard.Quote memory other = quoteFor("LH402", "2026-10-29", 2);
+        other.payout = 450e6; // 900 on the date, against 80 % of 1010 = 808
+        bytes memory sig = signQuote(other, UNDERWRITER_KEY);
+        FlightGuard.AirnodeResponse memory sale = proof(AIRNODE_KEY, otherSale, block.timestamp, saleData("Expected"));
+        vm.prank(traveller);
+        vm.expectRevert(abi.encodeWithSelector(FlightGuard.DateCoverTooHigh.selector, 900e6, 808e6));
+        guard.buyPolicy(other, sig, sale);
+    }
+
+    function test_SettlingFreesTheCoverAgain() public {
+        uint256 id = buyLH400();
+        bytes32 key = guard.flightKey("LH400", "2026-10-29");
+        assertEq(guard.flightCover(key), 100e6);
+        assertEq(guard.dateCover(guard.dateKey("2026-10-29")), 100e6);
+        bytes memory outcome = signResponse(AIRNODE_KEY, LH400_20261029_HASH, SIGNED_AT, ON_TIME_DATA);
+        vm.warp(SIGNED_AT + 60);
+        guard.settle(id, SIGNED_AT, ON_TIME_DATA, outcome);
+        assertEq(guard.flightCover(key), 0);
+        assertEq(guard.dateCover(guard.dateKey("2026-10-29")), 0);
     }
 }

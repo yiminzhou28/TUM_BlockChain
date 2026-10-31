@@ -12,11 +12,11 @@ import {AirnodeV2Test} from "./utils/AirnodeV2Test.sol";
 /// real response the AeroDataBox Airnode signed afterwards. Test only: the real contract always requires the proof.
 contract FlightGuardHarness is FlightGuard {
     constructor(address airnode_, IERC20 token_, address underwriter_, uint256 keeperReward_)
-        FlightGuard(airnode_, token_, underwriter_, keeperReward_)
+        FlightGuard(airnode_, token_, underwriter_, keeperReward_, 500e6)
     {}
 
-    function issue(Quote calldata quote) external returns (uint256) {
-        return _issuePolicy(quote);
+    function issue(Quote calldata quote, uint256 scheduledArrival) external returns (uint256) {
+        return _issuePolicy(quote, scheduledArrival);
     }
 }
 
@@ -69,11 +69,15 @@ contract FlightGuardRealDataTest is AirnodeV2Test {
         });
     }
 
-    /// The flight has already flown, so the policy is issued without a proof of sale
+    /// LH400's scheduled arrival, 2026-10-29 18:35Z, which the proof of sale would have carried
+    uint256 constant LH400_SCHEDULED_ARRIVAL = 1793298900;
+
+    /// The flight has already flown, so the policy is issued without a proof of sale, with the scheduled arrival the
+    /// proof of sale would have carried (LH400's; a cancelled flight never uses it)
     function issue(string memory flightNumber, string memory dateLocal, uint256 threshold) internal returns (uint256) {
         FlightGuard.Quote memory q = quoteFor(flightNumber, dateLocal, threshold, 0);
         vm.prank(traveller);
-        return guard.issue(q);
+        return guard.issue(q, LH400_SCHEDULED_ARRIVAL);
     }
 
     function readFixture(string memory path) internal view returns (string memory) {
