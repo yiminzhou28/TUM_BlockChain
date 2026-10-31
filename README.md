@@ -20,6 +20,28 @@ Built for the API3 AirnodeHub track of the TUM Blockchain & AI Hackathon 2026.
 | Payment token              | aUSD `0xbeA34973e5f67F18F656A2C6070C64326C791808`                                                                                    |
 | Try everything locally     | `pnpm e2e`: a day of flights on a local chain, 65 checks, nothing real spent                                                         |
 
+## For judges: 60 seconds
+
+1. **Signed data decides every payment.** A live purchase on
+   [FlightGuard v5](https://sepolia.basescan.org/address/0x154495adb5b699654baa13c862d04dc2eedad523): the contract
+   verified AeroDataBox's signed proof of sale (LH109 MUC-FRA, status Expected, 2+ h before departure) before it took
+   the premium, and stored the scheduled arrival the delay will be measured from:
+   [transaction](https://sepolia.basescan.org/tx/0x55d5331771867451dea43d0e049da67cdf629744b5ba5aaee276da60bc646a2b).
+2. **An agent settles on its own.** Overnight, the watch keeper slept until each flight was due, bought the signed
+   arrivals over x402 and settled two real policies with no one at the computer:
+   [DE1130](https://sepolia.basescan.org/tx/0x0ea79c52a5a6bd2a496d48e40da2a94a5dae2802e397f757e40692a07033819a) and
+   [DE1598](https://sepolia.basescan.org/tx/0x290025febe2e78902aab148e93b9a89391727b20edf53a0191b52de96e9cd96b).
+3. **Tampering reverts.** An edited value, a response too old, a response to another request and a signature by
+   another key, each on buying and on both settlement paths:
+   `forge test --match-contract FlightGuard --match-test RevertWhen`.
+4. **A whole day, locally, nothing real spent.** `pnpm e2e` (65 checks): the agent quotes, refuses what it should not
+   sell, the traveller buys, and the keeper pays out a late flight, a cancelled one, a missed connection and a flight
+   the airline retimed after the sale.
+
+No live policy has paid out yet: every real flight we insured so far landed on time, so the contract closed those
+policies without a payout, as it should. The payout path is shown with a response the real AeroDataBox Airnode signed
+for a cancelled flight (LH638 on 30 Oct 2026, `forge test --match-test RealCancelledFlight`) and in the end-to-end run.
+
 ## What is new
 
 Flight delay insurance on a blockchain has been tried before: Etherisc's FlightDelay and AXA's fizzy (2017 to 2019)
@@ -428,6 +450,16 @@ money stays a response the provider signed, checked by the contract.
   the agent refuses flights whose past arrivals lacked it. Falling back to `runwayTime` would let whoever settles first
   choose the more favourable field.
 - AeroDataBox returns a list when one flight number has several legs; the projections read the first one.
-- Settlement uses the first final response that anyone submits within its one-hour freshness window.
+- Settlement uses the first final response that anyone submits within its one-hour freshness window. If AeroDataBox
+  corrects an arrival time within that hour, whoever settles first could pick the version that suits them. A short
+  dispute window after the first settlement, in which a later response can replace it, would close that.
+- **Parametric means basis risk.** Self-transfer cover pays when the first flight lands past the threshold, whether
+  or not the traveller then missed the second flight (it may be late too), and does not pay for a missed connection
+  that has another cause. That is the price of paying in minutes with no claim to prove.
+- **Sales close 2 hours before departure.** Within that time, delay news is often already known to the traveller, and
+  the proof of sale cannot show a revised departure (above). Travellers who buy at the gate are not served.
+- The underwriter address and `maxPayout` are fixed at deployment, so the pool owner should be a multisig from the
+  start and a new limit means a new deployment. `withdraw` keeps every reserved payout funded but does not recheck the
+  cover caps, so after a withdrawal the policies already sold on one flight can be more than half of what is left.
 
 Built on the [AirnodeHub hackathon starter](https://github.com/api3dao/airnodehub-hackathon-starter) (MIT).
