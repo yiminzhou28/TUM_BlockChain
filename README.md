@@ -15,6 +15,7 @@ Built for the API3 AirnodeHub track of the TUM Blockchain & AI Hackathon 2026.
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | Network                    | Base Sepolia (chain id 84532)                                                                                                        |
 | FlightGuard contract       | [`0x154495adb5b699654baa13c862d04dc2eedad523`](https://sepolia.basescan.org/address/0x154495adb5b699654baa13c862d04dc2eedad523)      |
+| Verified source            | [FlightGuard.sol on Blockscout](https://base-sepolia.blockscout.com/address/0x154495adb5b699654baa13c862d04dc2eedad523?tab=contract) |
 | Data source                | [AeroDataBox on AirnodeHub](https://airnodehub.api3.org/explore/aerodatabox): `flightStatusOnDate`, `flightDates`, `airportSchedule` |
 | AeroDataBox Airnode signer | `0x83FE2E8F24E66520B1902C3507De4F471248f2Ec`                                                                                         |
 | Payment token              | aUSD `0xbeA34973e5f67F18F656A2C6070C64326C791808`                                                                                    |
