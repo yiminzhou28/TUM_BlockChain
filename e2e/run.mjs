@@ -280,6 +280,20 @@ try {
   r = agent('quote', 'FG100', fg100, '1', '15');
   check('refuses a proof of sale signed by any other key', !r.ok && r.out.includes(`signed by ${IMPOSTOR}`), r.out);
   world.signerKey = AIRNODE_KEY;
+  for (const mode of ['missing', 'empty']) {
+    world.saleSignature = mode;
+    saveWorld();
+    r = agent('quote', 'FG100', fg100, '1', '15');
+    check(
+      `refuses a proof of sale with a ${mode} signature despite the correct published signer`,
+      !r.ok &&
+        r.out.includes('Data source checked:') &&
+        r.out.includes('Fetching the signed proof of sale') &&
+        !r.out.includes('Signed by underwriter'),
+      r.out
+    );
+  }
+  delete world.saleSignature;
   world.documentDown = true;
   const fg150 = addFlight('FG150', { departsIn: 2.5 * 3600, status: 'CheckIn' });
   r = agent('quote', 'FG150', fg150, '1', '15');

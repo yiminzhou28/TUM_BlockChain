@@ -139,6 +139,33 @@ contract FlightGuardTest is AirnodeV2Test {
         (,,,,, status,,,) = guard.policies(id);
     }
 
+    function test_RevertWhen_SaleProofHasNoSignature() public {
+        FlightGuard.AirnodeResponse memory sale = saleProof("Expected");
+        sale.signature = hex"";
+        expectBuyReverts(sale, abi.encodeWithSignature("ECDSAInvalidSignatureLength(uint256)", 0));
+        assertEq(guard.policyCount(), 0);
+        assertEq(usd.balanceOf(traveller), 100e6);
+        assertEq(guard.totalReserved(), 0);
+    }
+
+    function test_RevertWhen_ArrivalHasNoSignature() public {
+        uint256 id = buyLH400();
+        vm.warp(SIGNED_AT);
+        vm.expectRevert(abi.encodeWithSignature("ECDSAInvalidSignatureLength(uint256)", 0));
+        guard.settle(id, SIGNED_AT, DELAYED_DATA, hex"");
+        assertEq(uint256(statusOf(id)), uint256(FlightGuard.Status.Active));
+        assertEq(guard.totalReserved(), 100e6 + KEEPER_REWARD);
+    }
+
+    function test_RevertWhen_CancellationHasNoSignature() public {
+        uint256 id = buyLH400();
+        vm.warp(SIGNED_AT);
+        vm.expectRevert(abi.encodeWithSignature("ECDSAInvalidSignatureLength(uint256)", 0));
+        guard.settleCancelledOrDiverted(id, SIGNED_AT, bytes('{"status":"Canceled"}'), hex"");
+        assertEq(uint256(statusOf(id)), uint256(FlightGuard.Status.Active));
+        assertEq(guard.totalReserved(), 100e6 + KEEPER_REWARD);
+    }
+
     // ------------------------------------------------------------ request hashes
 
     function test_DerivesTheSameRequestHashesAsTheAirnode() public view {

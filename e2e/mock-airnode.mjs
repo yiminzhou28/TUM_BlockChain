@@ -70,7 +70,12 @@ const sign = async (request, data) => {
     encodePacked(['bytes32', 'uint256', 'bytes'], [requestHash, BigInt(timestamp), toHex(data)])
   );
   const signature = await account.signMessage({ message: { raw: digest } });
-  return { airnode: account.address, requestHash, timestamp, data, signature };
+  const response = { airnode: account.address, requestHash, timestamp, data, signature };
+  if (w.saleSignature && request.responseProjection?.scheduledDeparture) {
+    if (w.saleSignature === 'missing') delete response.signature;
+    else response.signature = '0x';
+  }
+  return response;
 };
 
 // ---------------------------------------------------------------- the flights
