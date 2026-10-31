@@ -274,6 +274,13 @@ pnpm test                                 # TypeScript: pricing, connections, ex
 pnpm e2e                                  # end to end on a local chain (about 4 minutes, needs Foundry)
 ```
 
+The four tamper cases a judge can try, on every path (buying, settling a landed flight, settling a cancelled one): an
+edited value, a response too old, a response to another request, a signature by another key. All revert:
+
+```sh
+forge test --match-contract FlightGuard --match-test RevertWhen   # every revert case, by name
+```
+
 `test/FlightGuard.t.sol` covers the proof of sale (each unsellable status, exactly 2 hours, too old, edited, another
 flight or date, wrong key, an arrival or status response used as a proof of sale), both settlement paths and their
 tamper cases, the keeper reward on every path, expiry and the pool.
@@ -376,24 +383,32 @@ node --env-file=.env src/agent.ts status
 | `src/fetch-flight.ts`, `src/find-cancelled.ts`, `src/explore-flight.ts`       | Fetch, find and inspect signed flight data                                              |
 | `e2e/run.mjs`, `e2e/mock-airnode.mjs`                                         | The end-to-end test and its stand-in Airnode                                            |
 
-## Limitations and next steps
+## From hackathon to production
 
-- **A richer prior.** AeroDataBox's airport and route delay statistics are not served on AirnodeHub, so the prior comes
-  from the flights the agent has observed. Route and airport rates, and weather from other AirnodeHub listings, would
-  sharpen it, and would counter the traveller who knows a storm is coming.
+What a real deployment would change, in the order we would do it. None of it changes the core: every input that moves
+money stays a response the provider signed, checked by the contract.
+
+| Today                                                                    | In production                                                                                                  | Why                                                                                                   |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| The delay is measured against the scheduled arrival in the outcome       | Store the scheduled arrival from the proof of sale at purchase and measure against it                          | An airline retiming the flight after the sale is a delay to the traveller who bought the old schedule |
+| One key owns the pool, signs quotes and pays for data                    | A quote-signing key the pool owner can rotate, with limits per quote and per day; the pool owned by a multisig | A leaked agent key could sign underpriced quotes; today it would have the whole pool                  |
+| Holder, flight number and date are public on-chain                       | Policies held by the platform's wallet, or a salted commitment to flight and date revealed at settlement       | Anyone can see who flies where and when                                                               |
+| One data source                                                          | A second, independent flight data Airnode that must agree, or a fallback when one lags                         | Removes the single trusted signer and outages                                                         |
+| The traveller types the operating flight number                          | Resolve codeshare numbers to the operating flight before quoting                                               | Tickets often carry a partner's flight number                                                         |
+| Exposure caps in the agent; a fully reserved pool                        | Caps and a pause in the contract; capital from liquidity providers or a reinsurer                              | Concentration limits that do not depend on the agent, and capital that scales                         |
+| Price from the flight's last departures and the agent's population prior | Add route and airport delay rates, weather and time of day; tiered payouts (30, 60, 120 minutes)               | Sharper prices, and less room for a traveller who knows a storm is coming                             |
+| Testnet aUSD from the traveller's wallet                                 | USDC on Base, paid by the platform or the assistant at checkout; payout to the traveller's wallet or account   | Travellers do not need crypto                                                                         |
+| A licence is out of scope                                                | A licensed insurer or MGA runs the underwriter agent and the pool                                              | Selling insurance needs a licence; FlightGuard is their settlement layer                              |
+
+### Known limitations
+
 - **The proof of sale cannot show a known delay.** A projection pointer that is missing is an error, and most flights
   have no revised departure time until they are late, so the sale projection leaves it out. The agent checks it off-chain
   before it signs, and the quote expires within 10 minutes.
-- **A second data source.** Requiring two independent flight data providers to agree would remove the single trusted
-  Airnode key.
-- **Exposure caps are the agent's, not the contract's.** Concentration can only hurt the underwriter, because every
-  payout is reserved; the contract could enforce the caps too.
 - If AeroDataBox reports an arrival without a `revisedTime`, the arrival request fails and the policy can only expire;
   the agent refuses flights whose past arrivals lacked it. Falling back to `runwayTime` would let whoever settles first
   choose the more favourable field.
 - AeroDataBox returns a list when one flight number has several legs; the projections read the first one.
 - Settlement uses the first final response that anyone submits within its one-hour freshness window.
-- Selling insurance needs a licensed carrier. FlightGuard is settlement infrastructure for a licensed insurer or a travel
-  platform.
 
 Built on the [AirnodeHub hackathon starter](https://github.com/api3dao/airnodehub-hackathon-starter) (MIT).
